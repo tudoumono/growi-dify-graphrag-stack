@@ -239,6 +239,115 @@ def build_pdf_payload(
     return payload
 
 
+def build_markdown_payload(
+    md_path: Path,
+    input_root: Path,
+    title: str | None = None,
+    category: str | None = None,
+    language: str | None = None,
+) -> dict[str, Any]:
+    """Markdown ファイルを読んで payload dict を返す。送信はしない。
+
+    将来の拡張ポイント:
+    - フロントマター（--- で囲まれた YAML）から title / category / tags を自動抽出
+    - # ヘッダー構造をチャンク境界のヒントとして使う
+    """
+    md_path = md_path.resolve()
+
+    try:
+        relative = md_path.relative_to(input_root)
+    except ValueError:
+        print(
+            f"ファイルが INGEST_INPUT_ROOT ({input_root}) の外にあります: {md_path}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    stem_path = str(relative.with_suffix("")).replace("/", "_").replace("\\", "_")
+    document_id = f"md-{stem_path}"
+
+    print(f"Markdown を読み込み中: {md_path} ...")
+    text = md_path.read_text(encoding="utf-8")
+    if not text.strip():
+        print(f"テキストが空です: {md_path}", file=sys.stderr)
+        sys.exit(1)
+
+    auto_metadata: dict[str, Any] = {
+        "source_type": "markdown",
+        "filename": md_path.name,
+        "dir": str(relative.parent) if str(relative.parent) != "." else "",
+        "path": str(relative),
+    }
+
+    payload: dict[str, Any] = {
+        "document_id": document_id,
+        "title": title or md_path.stem,
+        "url": "",
+        "source_ref": str(relative),
+        "text": text,
+        "source": "markdown",
+        "metadata": auto_metadata,
+    }
+    if category:
+        payload["category"] = category
+    if language:
+        payload["language"] = language
+
+    return payload
+
+
+def build_txt_payload(
+    txt_path: Path,
+    input_root: Path,
+    title: str | None = None,
+    category: str | None = None,
+    language: str | None = None,
+) -> dict[str, Any]:
+    """テキストファイルを読んで payload dict を返す。送信はしない。"""
+    txt_path = txt_path.resolve()
+
+    try:
+        relative = txt_path.relative_to(input_root)
+    except ValueError:
+        print(
+            f"ファイルが INGEST_INPUT_ROOT ({input_root}) の外にあります: {txt_path}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    stem_path = str(relative.with_suffix("")).replace("/", "_").replace("\\", "_")
+    document_id = f"txt-{stem_path}"
+
+    print(f"テキストファイルを読み込み中: {txt_path} ...")
+    text = txt_path.read_text(encoding="utf-8")
+    if not text.strip():
+        print(f"テキストが空です: {txt_path}", file=sys.stderr)
+        sys.exit(1)
+
+    auto_metadata: dict[str, Any] = {
+        "source_type": "txt",
+        "filename": txt_path.name,
+        "dir": str(relative.parent) if str(relative.parent) != "." else "",
+        "path": str(relative),
+    }
+
+    payload: dict[str, Any] = {
+        "document_id": document_id,
+        "title": title or txt_path.stem,
+        "url": "",
+        "source_ref": str(relative),
+        "text": text,
+        "source": "txt",
+        "metadata": auto_metadata,
+    }
+    if category:
+        payload["category"] = category
+    if language:
+        payload["language"] = language
+
+    return payload
+
+
 def cmd_pdf(args: argparse.Namespace) -> None:
     # PDF 取り込みの全体順:
     # 1. ファイルの存在確認
@@ -252,6 +361,40 @@ def cmd_pdf(args: argparse.Namespace) -> None:
     input_root = get_input_root()
     payload = build_pdf_payload(
         pdf_path=pdf_path,
+        input_root=input_root,
+        title=args.title,
+        category=args.category,
+        language=args.language,
+    )
+    send_and_print(args.graphrag_url, payload)
+
+
+def cmd_md(args: argparse.Namespace) -> None:
+    md_path = Path(args.file)
+    if not md_path.exists():
+        print(f"ファイルが見つかりません: {md_path}", file=sys.stderr)
+        sys.exit(1)
+
+    input_root = get_input_root()
+    payload = build_markdown_payload(
+        md_path=md_path,
+        input_root=input_root,
+        title=args.title,
+        category=args.category,
+        language=args.language,
+    )
+    send_and_print(args.graphrag_url, payload)
+
+
+def cmd_txt(args: argparse.Namespace) -> None:
+    txt_path = Path(args.file)
+    if not txt_path.exists():
+        print(f"ファイルが見つかりません: {txt_path}", file=sys.stderr)
+        sys.exit(1)
+
+    input_root = get_input_root()
+    payload = build_txt_payload(
+        txt_path=txt_path,
         input_root=input_root,
         title=args.title,
         category=args.category,
@@ -287,12 +430,30 @@ def main() -> None:
     pdf_parser.add_argument("--category", help="GraphRAG 側のカテゴリ")
     pdf_parser.add_argument("--language", help="ドキュメント言語 (例: ja)")
 
+    # md サブコマンド
+    md_parser = subparsers.add_parser("md", help="Markdown ファイルを取り込む")
+    md_parser.add_argument("--file", required=True, help="Markdown ファイルのパス")
+    md_parser.add_argument("--title", help="ドキュメントのタイトル（省略時はファイル名）")
+    md_parser.add_argument("--category", help="GraphRAG 側のカテゴリ")
+    md_parser.add_argument("--language", help="ドキュメント言語 (例: ja)")
+
+    # txt サブコマンド
+    txt_parser = subparsers.add_parser("txt", help="テキストファイルを取り込む")
+    txt_parser.add_argument("--file", required=True, help="テキストファイルのパス")
+    txt_parser.add_argument("--title", help="ドキュメントのタイトル（省略時はファイル名）")
+    txt_parser.add_argument("--category", help="GraphRAG 側のカテゴリ")
+    txt_parser.add_argument("--language", help="ドキュメント言語 (例: ja)")
+
     args = parser.parse_args()
 
     if args.command == "growi":
         cmd_growi(args)
     elif args.command == "pdf":
         cmd_pdf(args)
+    elif args.command == "md":
+        cmd_md(args)
+    elif args.command == "txt":
+        cmd_txt(args)
 
 
 if __name__ == "__main__":
