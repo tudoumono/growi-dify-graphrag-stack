@@ -1,0 +1,110 @@
+version: '3'
+
+services:
+  app-1:
+    image: growilabs/growi:7
+    ports:
+      - 127.0.0.1:3001:3000
+    links:
+      - mongo:mongo
+      - elasticsearch:elasticsearch
+    depends_on:
+        mongo:
+          condition: service_healthy
+        elasticsearch:
+          condition: service_healthy
+    environment:
+      - MONGO_URI=mongodb://mongo:27017/growi-1
+      - ELASTICSEARCH_URI=http://elasticsearch:9200/growi-1
+      - PASSWORD_SEED=changeme
+    entrypoint: "/docker-entrypoint.sh"
+    command: ["npm run migrate && node -r dotenv-flow/config --expose_gc dist/server/app.js"]
+    restart: unless-stopped
+    volumes:
+      - growi_data_1:/data
+
+  app-2:
+    image: growilabs/growi:7
+    ports:
+      - 127.0.0.1:3002:3000
+    links:
+      - mongo:mongo
+      - elasticsearch:elasticsearch
+    depends_on:
+        mongo:
+          condition: service_healthy
+        elasticsearch:
+          condition: service_healthy
+    environment:
+      - MONGO_URI=mongodb://mongo:27017/growi-2
+      - ELASTICSEARCH_URI=http://elasticsearch:9200/growi-2
+      - PASSWORD_SEED=changeme
+    entrypoint: "/docker-entrypoint.sh"
+    command: ["npm run migrate && node -r dotenv-flow/config --expose_gc dist/server/app.js"]
+    restart: unless-stopped
+    volumes:
+      - growi_data_2:/data
+
+  app-3:
+    image: growilabs/growi:7
+    ports:
+      - 127.0.0.1:3003:3000
+    links:
+      - mongo:mongo
+      - elasticsearch:elasticsearch
+    depends_on:
+        mongo:
+          condition: service_healthy
+        elasticsearch:
+          condition: service_healthy
+    environment:
+      - MONGO_URI=mongodb://mongo:27017/growi-3
+      - ELASTICSEARCH_URI=http://elasticsearch:9200/growi-3
+      - PASSWORD_SEED=changeme
+    entrypoint: "/docker-entrypoint.sh"
+    command: ["npm run migrate && node -r dotenv-flow/config --expose_gc dist/server/app.js"]
+    restart: unless-stopped
+    volumes:
+      - growi_data_3:/data
+
+  mongo:
+    image: mongo:8.0
+    restart: unless-stopped
+    volumes:
+      - mongo_configdb:/data/configdb
+      - mongo_db:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.runCommand('ping').ok", "--quiet"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  elasticsearch:
+    build:
+      context: ./elasticsearch/v9
+      dockerfile: ./Dockerfile
+    environment:
+      - bootstrap.memory_lock=true
+      - "ES_JAVA_OPTS=-Xms256m -Xmx256m"  # increase amount if you have enough memory
+      - LOG4J_FORMAT_MSG_NO_LOOKUPS=true # CVE-2021-44228 mitigation for Elasticsearch <= 6.8.20/7.16.0
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    restart: unless-stopped
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+      - ./elasticsearch/v9/config/elasticsearch.yml:/usr/share/elasticsearch/config/elasticsearch.yml
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9200"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+volumes:
+  growi_data_1:
+  growi_data_2:
+  growi_data_3:
+  mongo_configdb:
+  mongo_db:
+  es_data:

@@ -1,0 +1,24 @@
+fastapi==0.111.0
+uvicorn==0.30.1
+pydantic==2.7.4
+
+# Elasticsearch クライアント
+elasticsearch==8.14.0
+
+# Neo4j ドライバー
+neo4j==5.20.0
+
+# AWS SDK (Bedrock 埋め込み・エンティティ抽出)
+boto3==1.34.144
+
+# Ollama 呼び出し用 HTTP クライアント
+httpx>=0.28.1
+
+# Google Gemini（新SDK: v1 stable API 対応）
+google-genai==1.14.0
+
+# テキスト分割
+langchain-text-splitters==0.2.2
+
+# PDF テキスト抽出
+pdfplumber==0.11.4

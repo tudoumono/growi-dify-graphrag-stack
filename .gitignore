@@ -1,0 +1,17 @@
+# シークレットを含む .env ファイル
+langfuse/.env
+dify/.env
+growi/.env
+graphrag/.env
+
+# Docker ボリューム・一時ファイル
+dify/volumes/
+growi/volumes/
+*.log
+__pycache__/
+*.py[cod]
+graphrag/.venv/
+
+# OS
+.DS_Store
+tmp

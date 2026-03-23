@@ -1,0 +1,132 @@
+services:
+  graphrag-es:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.14.3
+    container_name: graphrag-es
+    restart: always
+    ports:
+      - "9201:9200"
+    environment:
+      cluster.name: graphrag-es-cluster
+      node.name: graphrag-es0
+      discovery.type: single-node
+      xpack.license.self_generated.type: basic
+      xpack.security.enabled: "true"
+      xpack.security.enrollment.enabled: "false"
+      xpack.security.http.ssl.enabled: "false"
+      ELASTIC_PASSWORD: ${GRAPHRAG_ES_PASSWORD:-graphrag}
+    volumes:
+      - graphrag_es_data:/usr/share/elasticsearch/data
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf -u \"elastic:${GRAPHRAG_ES_PASSWORD:-graphrag}\" http://localhost:9200/_cluster/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+  graphrag-kibana:
+    image: docker.elastic.co/kibana/kibana:8.14.3
+    container_name: graphrag-kibana
+    restart: always
+    depends_on:
+      - graphrag-es
+    ports:
+      - "5602:5601"
+    environment:
+      XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY: d1a66dfd-c4d3-4a0a-8290-2abcb83ab3aa
+      NO_PROXY: localhost,127.0.0.1,graphrag-es,graphrag-kibana
+      XPACK_SECURITY_ENABLED: "true"
+      XPACK_SECURITY_ENROLLMENT_ENABLED: "false"
+      XPACK_SECURITY_HTTP_SSL_ENABLED: "false"
+      XPACK_FLEET_ISAIRGAPPED: "true"
+      ELASTICSEARCH_HOSTS: http://graphrag-es:9200
+      ELASTICSEARCH_USERNAME: elastic
+      ELASTICSEARCH_PASSWORD: ${GRAPHRAG_ES_PASSWORD:-graphrag}
+      I18N_LOCALE: ja-JP
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5601/api/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+  neo4j:
+    image: neo4j:5.20.0
+    container_name: neo4j
+    restart: always
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-dify-graphrag}
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_apoc_export_file_enabled: "true"
+      NEO4J_apoc_import_file_enabled: "true"
+    volumes:
+      - graphrag_neo4j_data:/data
+      - graphrag_neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD", "neo4j", "status"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+  graphrag-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: graphrag-api
+    restart: always
+    depends_on:
+      - graphrag-es
+      - neo4j
+    ports:
+      - "8080:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ${HOME}/.aws:/root/.aws:ro
+    environment:
+      ELASTICSEARCH_HOST: graphrag-es
+      ELASTICSEARCH_PORT: "9200"
+      ELASTICSEARCH_USERNAME: elastic
+      ELASTICSEARCH_PASSWORD: ${GRAPHRAG_ES_PASSWORD:-graphrag}
+      ELASTICSEARCH_INDEX: graphrag_chunks
+
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USERNAME: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-dify-graphrag}
+
+      EMBED_PROVIDER: ${EMBED_PROVIDER:-bedrock}
+      LLM_PROVIDER: ${LLM_PROVIDER:-bedrock}
+
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_EMBED_MODEL: ${GEMINI_EMBED_MODEL:-text-embedding-004}
+      GEMINI_LLM_MODEL: ${GEMINI_LLM_MODEL:-gemini-2.0-flash}
+
+      AWS_PROFILE: ${AWS_PROFILE:-sandbox}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      BEDROCK_EMBED_MODEL: ${BEDROCK_EMBED_MODEL:-amazon.titan-embed-text-v2:0}
+      BEDROCK_LLM_MODEL: ${BEDROCK_LLM_MODEL:-us.anthropic.claude-haiku-4-5-20251001-v1:0}
+
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-nomic-embed-text}
+      OLLAMA_LLM_MODEL: ${OLLAMA_LLM_MODEL:-llama3}
+      EMBED_DIMS: ${EMBED_DIMS:-768}
+
+      CHUNK_SIZE: ${CHUNK_SIZE:-800}
+      CHUNK_OVERLAP: ${CHUNK_OVERLAP:-120}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+volumes:
+  graphrag_es_data:
+    driver: local
+  graphrag_neo4j_data:
+    driver: local
+  graphrag_neo4j_logs:
+    driver: local
