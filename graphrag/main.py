@@ -1,14 +1,39 @@
 """
 GraphRAG API - Elasticsearch と Neo4j を使ったハイブリッド検索 API
+
+このファイルの大きな処理は 2 系統あります。
+
+1. /ingest
+   受け取った 1 つの文書をチャンクに分割し、Elasticsearch と Neo4j の両方へ保存する。
+   検索時に速く引くための「ベクトル検索用データ」と、
+   関連文脈をたどるための「グラフ構造」を同時に作る。
+
+2. /search
+   まず Elasticsearch で意味的に近いチャンクを探し、
+   次に Neo4j で「同じエンティティを含む別チャンク」をたどって補助コンテキストを増やす。
+
+将来の改修では、まず /ingest と /search の順序を頭に入れてから読むと追いやすい。
 """
 
 from __future__ import annotations
 
+# Python 標準ライブラリ。
+# json: LLM の JSON 出力や metadata の文字列化に使う
+# logging: エラーや起動情報をログに出す
+# os: 環境変数から接続先やモデル設定を読む
+# Any: 「いろいろな型が入る」ことを型ヒントで表す
 import json
 import logging
 import os
 from typing import Any
 
+# 外部ライブラリ。
+# Elasticsearch: ベクトル検索用の ES クライアント
+# FastAPI / Query / Request: API エンドポイントとリクエスト定義
+# JSONResponse: エラー時の JSON レスポンス返却
+# RecursiveCharacterTextSplitter: 長文を chunk に分割
+# GraphDatabase: Neo4j 接続ドライバー生成
+# BaseModel / Field: API の入出力データ構造を定義
 from elasticsearch import Elasticsearch
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
@@ -16,6 +41,10 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from neo4j import GraphDatabase
 from pydantic import BaseModel, Field
 
+# プロジェクト内モジュール。
+# providers.py から「埋め込みモデル」と「LLM」の抽象型・生成関数を読み込む。
+# 実体は Bedrock / Gemini / Ollama のいずれかだが、
+# main.py 側は違いを意識せず同じ呼び方で使える。
 from providers import EmbedProvider, LLMProvider, get_embed_provider, get_llm_provider
 
 logging.basicConfig(level=logging.INFO)
@@ -26,6 +55,9 @@ app = FastAPI(title="GraphRAG API", version="0.2.0")
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    # FastAPI 全体の最終エラーハンドラ。
+    # 個別処理で拾えなかった例外をログに残し、API 利用側へ 500 エラーを返す。
+    # 開発中に「どこで失敗したか」を追う入口にもなる。
     logger.exception("Unhandled error: %s", exc)
     return JSONResponse(
         status_code=500,
@@ -51,10 +83,14 @@ _llm_provider: LLMProvider | None = None
 
 def compact_dict(values: dict[str, Any]) -> dict[str, Any]:
     """None を除外して保存用の dict を作る"""
+    # ES 保存時に使う整形関数。
+    # None を除いておくと、不要な空項目を保存せずに済む。
     return {key: value for key, value in values.items() if value is not None}
 
 
 def metadata_json(metadata: dict[str, Any]) -> str | None:
+    # Neo4j では dict をそのまま扱いにくいため、metadata を JSON 文字列へ変換する。
+    # metadata が空なら None を返し、「値なし」として保存する。
     if not metadata:
         return None
     return json.dumps(metadata, ensure_ascii=False)
@@ -62,6 +98,12 @@ def metadata_json(metadata: dict[str, Any]) -> str | None:
 
 @app.on_event("startup")
 def startup() -> None:
+    # 起動時の順番:
+    # 1. 埋め込みモデルと LLM のプロバイダーを初期化する
+    # 2. 現在の設定値（次元数、chunk サイズなど）をログに出す
+    # 3. 旧スキーマ由来の不要な RELATED_TO を掃除する
+    #
+    # 将来、プロバイダー追加や初期化順の変更をするならこの関数から確認する。
     global _embed_provider, _llm_provider
     _embed_provider = get_embed_provider()
     _llm_provider = get_llm_provider()
@@ -91,20 +133,34 @@ def startup() -> None:
 
 
 def embed_provider() -> EmbedProvider:
+    # startup() で初期化済みの埋め込みプロバイダーを返す。
+    # ここで返る実体は Bedrock / Gemini / Ollama のいずれか。
+    # assert は「startup 前に呼ばれていないこと」の簡易チェックで、
+    # まだ初期化されていなければ即座に異常に気づけるようにしている。
     assert _embed_provider is not None
     return _embed_provider
 
 
 def llm_provider() -> LLMProvider:
+    # startup() で初期化済みの LLM プロバイダーを返す。
+    # entity 抽出や relation 抽出は毎回この関数経由で同じ設定の LLM を使う。
+    # こちらも assert により、初期化漏れを早い段階で検出する。
     assert _llm_provider is not None
     return _llm_provider
 
 
 def get_es_client() -> Elasticsearch:
+    # Elasticsearch に接続するクライアントを都度生成する。
+    # 役割は「ベクトル検索用の本文チャンクを保存・検索すること」。
+    # 接続先は環境変数 ELASTICSEARCH_HOST / PORT / USER / PASSWORD で切り替わる。
     return Elasticsearch(f"http://{ES_HOST}:{ES_PORT}", basic_auth=(ES_USER, ES_PASS))
 
 
 def get_neo4j_driver():
+    # Neo4j に接続するドライバーを生成する。
+    # 役割は「Document / Chunk / Entity のグラフ構造を保存し、
+    # 検索時に関連チャンクをたどること」。
+    # ES が“近い文章を探す担当”なら、Neo4j は“つながりを広げる担当”。
     return GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
 
 
@@ -112,6 +168,9 @@ def ensure_es_index(es: Elasticsearch) -> None:
     if es.indices.exists(index=ES_INDEX):
         return
 
+    # ES 側には「チャンク本文」と「ベクトル」を保存する。
+    # 特に embedding.dims は埋め込みモデルと一致している必要がある。
+    # ここを変えた場合は、既存インデックスを作り直して再取り込みが必要。
     mapping = {
         "mappings": {
             "properties": {
@@ -120,6 +179,7 @@ def ensure_es_index(es: Elasticsearch) -> None:
                 "title": {"type": "text"},
                 "text": {"type": "text"},
                 "url": {"type": "keyword"},
+                "source_ref": {"type": "keyword"},
                 "chunk_index": {"type": "integer"},
                 "category": {"type": "keyword"},
                 "source": {"type": "keyword"},
@@ -148,6 +208,13 @@ def ensure_es_index(es: Elasticsearch) -> None:
 
 
 def extract_entities(text: str) -> list[dict[str, Any]]:
+    # 取り込み時の中盤ステップ:
+    # 1. チャンク本文を LLM に渡す
+    # 2. エンティティ一覧を JSON で返させる
+    # 3. パースに失敗したら空配列にして取り込み自体は継続する
+    #
+    # この実装では「取り込み失敗」より「多少情報が欠けても保存完了」を優先している。
+    # 品質改善したい場合は、まずこのプロンプトと JSON パース失敗率を確認する。
     prompt = (
         "以下のテキストから固有表現（人名・組織・概念・場所など）を抽出し、"
         "JSON 配列で返してください。\n"
@@ -166,6 +233,9 @@ def extract_entities(text: str) -> list[dict[str, Any]]:
 
 
 def extract_relations(entities: list[dict[str, Any]], text: str) -> list[dict[str, Any]]:
+    # 関係抽出はエンティティが 2 件以上ある時だけ実行する。
+    # 先にエンティティ抽出を済ませ、その結果を relation 抽出の入力に使うため、
+    # ingest 内では「entity -> relation」の順番が固定。
     if len(entities) < 2:
         return []
 
@@ -195,6 +265,7 @@ class IngestRequest(BaseModel):
     document_id: str
     title: str
     url: str
+    source_ref: str = ""
     text: str
     category: str | None = None
     source: str | None = None
@@ -237,10 +308,13 @@ class ProviderInfo(BaseModel):
 
 def document_properties(req: IngestRequest) -> dict[str, Any]:
     # None を含めて全フィールドを返す: SET d = $props で完全置き換えするため
+    # Document ノード用のプロパティを 1 箇所で組み立てる関数。
+    # 将来、文書単位の属性を増やすならまずここを触る。
     return {
         "id": req.document_id,
         "title": req.title,
         "url": req.url,
+        "source_ref": req.source_ref or None,
         "category": req.category,
         "source": req.source,
         "tags": req.tags or None,
@@ -252,6 +326,10 @@ def document_properties(req: IngestRequest) -> dict[str, Any]:
 
 
 def chunk_document(req: IngestRequest) -> list[str]:
+    # チャンク分割は ingest の最初の主要処理。
+    # CHUNK_SIZE を大きくすると 1 チャンクの情報量は増えるが、
+    # 検索の粒度は粗くなる。CHUNK_OVERLAP は文脈の切れ目を減らすための重なり。
+    # 検索精度の調整で最初に触ることが多い。
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
@@ -260,6 +338,8 @@ def chunk_document(req: IngestRequest) -> list[str]:
 
 
 def build_es_filters(req: SearchRequest) -> list[dict[str, Any]]:
+    # 検索時の category / source / language 条件を ES の filter 形式へ変換する。
+    # 検索対象を狭めたい要件を増やす場合はここに条件を足す。
     filters: list[dict[str, Any]] = []
     if req.category:
         filters.append({"term": {"category": req.category}})
@@ -271,6 +351,9 @@ def build_es_filters(req: SearchRequest) -> list[dict[str, Any]]:
 
 
 def perform_search(req: SearchRequest) -> SearchResponse:
+    # /search の薄いラッパー関数。
+    # 接続の生成とクローズだけを担当し、実際の検索ロジックは _perform_search_inner に寄せる。
+    # テスト時には inner を直接呼ぶとロジックだけ検証しやすい。
     es = get_es_client()
     driver = get_neo4j_driver()
     try:
@@ -280,6 +363,15 @@ def perform_search(req: SearchRequest) -> SearchResponse:
 
 
 def _perform_search_inner(es: Elasticsearch, driver: Any, req: SearchRequest) -> SearchResponse:
+    # /search の順番:
+    # 1. クエリを embedding 化する
+    # 2. Elasticsearch に kNN 検索を投げる
+    # 3. 上位チャンクを seed として保持する
+    # 4. seed が触れている Entity を Neo4j でたどる
+    # 5. 共有 Entity を持つ別チャンクを graph_hits として集める
+    # 6. ES 結果 -> グラフ結果の順で重複除去しながら merged_context を作る
+    #
+    # つまり検索の主役は ES、Neo4j は「検索結果を広げる補助役」。
     knn = {
         "field": "embedding",
         "query_vector": embed_provider().embed(req.query),
@@ -328,6 +420,11 @@ def _perform_search_inner(es: Elasticsearch, driver: Any, req: SearchRequest) ->
 
     if seed_chunk_ids:
         with driver.session() as session:
+            # ここでは RELATED_TO ではなく、共有エンティティ経由で関連チャンクを取っている。
+            # 探索深さは実質 1 ホップ相当:
+            # seed chunk -> Entity -> related chunk
+            #
+            # 将来「2 ホップ以上」にしたい場合はこの Cypher を拡張する。
             result = session.run(
                 """
                 UNWIND $chunk_ids AS cid
@@ -364,6 +461,9 @@ def _perform_search_inner(es: Elasticsearch, driver: Any, req: SearchRequest) ->
     context_parts: list[str] = []
     citations: list[Citation] = []
 
+    # merged_context は ES の直接ヒットを先に並べる。
+    # その後にグラフで補った文脈を足すことで、
+    # 「質問に近い本文」を先頭に置いたまま関連情報を追加できる。
     for hit in es_hits:
         if hit["chunk_id"] in seen:
             continue
@@ -402,11 +502,15 @@ def _perform_search_inner(es: Elasticsearch, driver: Any, req: SearchRequest) ->
 
 @app.get("/health")
 def health() -> dict[str, str]:
+    # コンテナや監視から呼ばれる生存確認用エンドポイント。
+    # 「アプリが応答できるか」を最小限で返す。
     return {"status": "ok"}
 
 
 @app.get("/providers", response_model=ProviderInfo)
 def providers_info() -> ProviderInfo:
+    # 現在どの埋め込みモデル / LLM / chunk 設定で動いているかを返す。
+    # 動作確認や、設定ミス切り分けの確認口として使う。
     return ProviderInfo(
         embed_provider=os.environ.get("EMBED_PROVIDER", "bedrock"),
         embed_dims=embed_provider().dims,
@@ -421,6 +525,25 @@ def ingest(req: IngestRequest) -> dict[str, Any]:
     """
     ドキュメントを ES（ベクトル）と Neo4j（グラフ）へ取り込む。
     同じ document_id で再取り込みした場合、不要になった古いチャンクは削除される。
+
+    処理の順番:
+    1. ES インデックスがなければ作成する
+    2. 文書本文を chunk に分割する
+    3. Document ノードを作成または更新する
+    4. 再取り込み前提で旧 RELATED_TO を削除する
+    5. 各 chunk ごとに:
+       - embedding を生成して ES に保存
+       - Chunk ノードを Neo4j に保存
+       - MENTIONS を張り直す
+       - entity を抽出する
+       - relation を抽出して RELATED_TO を作る
+    6. 今回の chunk 数を超える古い chunk を Neo4j から削除する
+    7. 同じく古い chunk を ES から削除する
+
+    改良時の見どころ:
+    - 精度を変えたい: chunk サイズ、抽出プロンプト、検索 Cypher
+    - 性能を変えたい: LLM 呼び出し回数、ES の k 値、Neo4j 探索範囲
+    - 整合性を変えたい: 再取り込み時の削除順と失敗時の復旧方針
     """
     es = get_es_client()
     ensure_es_index(es)
@@ -432,19 +555,30 @@ def ingest(req: IngestRequest) -> dict[str, Any]:
 
     try:
         with driver.session() as session:
+            # Step 1. 文書メタデータ自体を Document ノードとして保存する。
+            # 文書タイトルや URL を後で graph_hits に付け直す時にも使う。
             session.run(
                 "MERGE (d:Document {id: $id}) SET d = $props",
                 id=req.document_id,
                 props=doc_props,
             )
 
-            # 再取り込み時: このドキュメント由来の RELATED_TO のみを安全に削除
+            # Step 2. 再取り込み前に、この文書が作った RELATED_TO だけ掃除する。
+            # 他文書由来の relation まで消さないよう source_document_id で絞る。
             session.run(
                 "MATCH ()-[r:RELATED_TO {source_document_id: $document_id}]->() DELETE r",
                 document_id=req.document_id,
             )
 
             for index, chunk_text in enumerate(chunks):
+                # Step 3. 1 chunk ずつ同じ順番で処理する。
+                # 3-1. chunk_id を決める
+                # 3-2. embedding を作る
+                # 3-3. ES に保存する
+                # 3-4. Neo4j の Chunk ノードを保存する
+                # 3-5. MENTIONS を削除して張り直す
+                # 3-6. entity を抽出して Entity ノードに結ぶ
+                # 3-7. relation を抽出して Entity 間に RELATED_TO を作る
                 chunk_id = f"{req.document_id}-chunk-{index}"
                 embedding = embed_provider().embed(chunk_text)
                 chunk_props = compact_dict(
@@ -454,6 +588,7 @@ def ingest(req: IngestRequest) -> dict[str, Any]:
                         "title": req.title,
                         "text": chunk_text,
                         "url": req.url,
+                        "source_ref": req.source_ref or None,
                         "chunk_index": index,
                         "category": req.category,
                         "source": req.source,
@@ -467,8 +602,9 @@ def ingest(req: IngestRequest) -> dict[str, Any]:
                 )
                 es.index(index=ES_INDEX, id=chunk_id, document=chunk_props)
 
-                # None を含めて全フィールドを渡す: SET c = $props で完全置き換えし
-                # 前回あったオプション項目（category 等）が今回 None なら削除される
+                # Neo4j 側は SET c = $props にして完全置き換えする。
+                # これにより前回取り込み時に存在した category 等が、
+                # 今回は未指定なら素直に消える。
                 neo4j_chunk_props = {
                     "id": chunk_id,
                     "document_id": req.document_id,
@@ -491,7 +627,8 @@ def ingest(req: IngestRequest) -> dict[str, Any]:
                     document_id=req.document_id,
                     props=neo4j_chunk_props,
                 )
-                # 再取り込み時: 古い MENTIONS を削除してから新しいエンティティを付け直す
+                # 再取り込み時に entity 抽出結果が変わることがあるため、
+                # 先に古い MENTIONS を消してから最新の結果を付け直す。
                 session.run(
                     "MATCH (c:Chunk {id: $id})-[r:MENTIONS]->() DELETE r",
                     id=chunk_id,
@@ -502,6 +639,8 @@ def ingest(req: IngestRequest) -> dict[str, Any]:
                     canonical = entity.get("canonical_name") or entity.get("name")
                     if not canonical:
                         continue
+                    # entity は canonical_name を軸に名寄せする簡易実装。
+                    # 同義語や表記揺れをより厳密に扱いたい場合はここを改良する。
                     session.run(
                         "MERGE (e:Entity {canonical_name: $canonical_name}) "
                         "SET e.name = $name, e.type = $type "
@@ -515,6 +654,8 @@ def ingest(req: IngestRequest) -> dict[str, Any]:
 
                 relations = extract_relations(entities, chunk_text)
                 for relation in relations:
+                    # relation もこの chunk 由来であることを source_document_id に残す。
+                    # 再取り込み時に安全に削除し直すための識別子。
                     session.run(
                         "MATCH (e1:Entity {canonical_name: $from_name}) "
                         "MATCH (e2:Entity {canonical_name: $to_name}) "
@@ -527,7 +668,8 @@ def ingest(req: IngestRequest) -> dict[str, Any]:
 
                 stored_chunks.append(chunk_id)
 
-            # 再取り込み時: chunk_index >= new_chunk_count の古いチャンクを Neo4j から削除
+            # Step 4. 今回の chunk 数より後ろにある古い chunk を Neo4j から削除する。
+            # 例: 前回 10 chunk、今回 7 chunk なら index 7-9 が不要になる。
             session.run(
                 "MATCH (c:Chunk) WHERE c.document_id = $document_id AND c.chunk_index >= $count "
                 "DETACH DELETE c",
@@ -540,8 +682,9 @@ def ingest(req: IngestRequest) -> dict[str, Any]:
     # 失敗時は再取り込みで回復する方針。ES は es.index() で既に上書き済みのため
     # ロールバックすると旧データも失われるため行わない。
 
-    # 再取り込み時: ES からも古いチャンクを削除
-    # Neo4j 側はすでに確定済みのため、ES 削除に失敗しても再取り込みで修復可能
+    # Step 5. ES 側も同じ条件で古い chunk を削除する。
+    # ここは後処理に分けており、もし失敗しても再取り込みで回復する設計。
+    # つまり「完全なトランザクション整合性」より「運用しやすい回復性」を優先している。
     stale_chunks_removed = True
     try:
         es.delete_by_query(
@@ -574,6 +717,8 @@ def ingest(req: IngestRequest) -> dict[str, Any]:
 
 @app.post("/search", response_model=SearchResponse)
 def search_post(req: SearchRequest) -> SearchResponse:
+    # JSON ボディで検索したい呼び出し元向けの POST 版。
+    # Dify や他アプリから API として呼ぶ時はこちらが使いやすい。
     return perform_search(req)
 
 
@@ -585,6 +730,8 @@ def search_get(
     source: str | None = None,
     language: str | None = None,
 ) -> SearchResponse:
+    # ブラウザや curl で試しやすい GET 版。
+    # クエリ文字列を SearchRequest に詰め替え、内部処理は POST 版と同じにしている。
     return perform_search(
         SearchRequest(
             query=query,
