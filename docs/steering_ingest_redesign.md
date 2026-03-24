@@ -103,9 +103,20 @@ API コストと処理時間の無駄が発生する。
   H: カテゴリ自動推定（親ディレクトリパス全体）
   I: ES の path_hierarchy tokenizer で階層検索を高速化
 
-[Phase 4] ingest.py 廃止・サーバー側取り込みへ移行
-  J: main.py に /ingest-dir エンドポイントを追加
-  K: ファイル監視（watchdog）や定期実行（cron）への対応
+[Phase 4] サーバー側バッチ取り込みと整合性確認
+  J: main.py に /ingest-dir エンドポイントを追加（非同期・バックグラウンド処理）
+  K: main.py に /ingest-job/{job_id} エンドポイントを追加（ジョブ状態確認）
+  L: main.py に GET /documents エンドポイントを追加（ES/Neo4j 整合性チェック）
+  M: ingest.py の input-dir サブコマンドを廃止
+
+[Phase 5] 管理UI・ファイル操作エンドポイント・ingest.py 廃止
+  N: input/ を Git リポジトリ化（事前準備）
+  O: docker-compose.yml の :ro → :rw 変更、Dockerfile に git インストール
+  P: main.py に POST /ingest-file エンドポイントを追加（アップロード + Git コミット）
+  Q: main.py に DELETE /documents/{document_id} エンドポイントを追加（削除 + Git コミット）
+  R: main.py に POST /ingest-growi エンドポイントを追加（サーバー側 Growi 取り込み）
+  S: GET /ui ブラウザ管理画面を追加（一覧・アップロード・削除）
+  T: ingest.py を廃止
 ```
 
 ---
@@ -138,34 +149,73 @@ Phase 1 が完了すると、「何が、どこから来たか」がデータか
 | カテゴリ自動推定 | `ingest.py` | 親ディレクトリパスをカテゴリに自動設定する |
 | path_hierarchy tokenizer | `main.py` | 上位階層カテゴリでの高速な階層検索を実現する |
 
-### Phase 4: ingest.py 廃止・サーバー側取り込みへ移行
+### Phase 4: サーバー側バッチ取り込みと整合性確認
 
 **背景と判断:**
 `ingest.py` は「ファイルを読んで POST /ingest を叩くクライアント」であり、
 `main.py` の `/ingest` 実装そのものではない。
-将来の定期実行・ファイル監視への自動化を考えると、コンテナ内で直接処理する方が自然。
-そのため `ingest.py` は一時的なツールと位置づけ、Phase 4 で廃止する。
+将来の管理 UI・自動化への移行を考えると、コンテナ内で直接処理する方が自然。
+Phase 4 では一括取り込みのサーバー移植と整合性確認機能を追加する。
+`ingest.py` の廃止は Phase 5 で行う。
 
 **やること:**
 
 | 対象 | 変更内容 |
 |------|---------|
-| `main.py` | `/ingest-dir` エンドポイントを追加。コンテナ内の `input/` を直接スキャン・取り込む |
-| `main.py` | ファイル監視（watchdog 等）や定期実行（cron）への対応 |
-| `ingest.py` | 廃止 |
-| `docker-compose.yml` | `input/` マウントは Phase 3 で追加済み。定期実行設定をここに追加 |
+| `main.py` | `POST /ingest-dir` を追加（非同期・バックグラウンド処理、ジョブID返却） |
+| `main.py` | `GET /ingest-job/{job_id}` を追加（ジョブ状態・処理件数確認） |
+| `main.py` | `GET /documents` を追加（ES と Neo4j の整合性チェック付き一覧） |
+| `ingest.py` | `input-dir` サブコマンドを廃止（他サブコマンドは Phase 5 まで残す） |
 
 **現状（Phase 3 完了時点）の運用:**
 ```bash
 docker exec graphrag-api python ingest.py input-dir
 ```
 
-**Phase 4 完了後の運用（予定）:**
+**Phase 4 完了後の運用:**
 ```bash
-# 手動トリガー
+# 一括取り込み開始
 curl -X POST http://localhost:8080/ingest-dir
+# → {"job_id": "abc123", "status": "running"}
 
-# 将来: cron やファイル監視で自動実行
+# ジョブ状態確認
+curl http://localhost:8080/ingest-job/abc123
+# → {"status": "done", "processed": 12, "skipped": 3}
+
+# 取り込み済みドキュメント一覧と整合性確認
+curl http://localhost:8080/documents
+```
+
+### Phase 5: 管理UI・ファイル操作エンドポイント・ingest.py 廃止
+
+**背景と判断:**
+ブラウザからファイルをアップロード・削除でき、その操作が GraphRAG（ES + Neo4j）に即時反映される管理画面を提供する。
+ファイル操作の履歴管理と誤削除対策として `input/` を Git リポジトリで管理する。
+Phase 5 完了時に `ingest.py` を廃止し、全操作をエンドポイント経由に統一する。
+
+**やること:**
+
+| 対象 | 変更内容 |
+|------|---------|
+| `input/`（事前準備） | `git init` で Git リポジトリ化 |
+| `docker-compose.yml` | `input/` マウントを `:ro` → `:rw` に変更 |
+| `Dockerfile` | `git` をインストール |
+| `main.py` | `POST /ingest-file` を追加（アップロード → input/ 保存 → 取り込み → Git コミット） |
+| `main.py` | `DELETE /documents/{document_id}` を追加（ES/Neo4j 削除 → ファイル削除 → Git コミット） |
+| `main.py` | `POST /ingest-growi` を追加（サーバー側から Growi API を呼び出して取り込み） |
+| `main.py` | `GET /ui` を追加（ブラウザ管理画面：一覧・アップロード・削除） |
+| `ingest.py` | 廃止 |
+
+**Phase 5 完了後の運用:**
+```bash
+# ブラウザで管理画面を開く
+http://localhost:8080/ui
+# → ファイルのドラッグ&ドロップでアップロード・取り込み
+# → 削除ボタンで ES/Neo4j とファイルを同時削除
+# → 一覧で ES/Neo4j の整合性を確認
+
+# ファイル操作の Git 履歴確認（ホスト側）
+cd /root/mywork/DIfy_Growi_Langfuse/input && git log --oneline
 ```
 
 ---
@@ -192,5 +242,6 @@ document_id はその配下からの相対パスで生成する。
 ## 7. 次のステップ
 
 - Phase 1〜3 実装・動作確認 完了（2026-03-24）
+- Phase 4 スペック確定（2026-03-24）→ 実装待ち
+- Phase 5 スペック確定（2026-03-24）→ Phase 4 完了後に着手
 - 現在の運用: `docker exec graphrag-api python ingest.py input-dir`
-- Phase 4 は実際のドキュメントを運用しながら安定を確認してから着手する
