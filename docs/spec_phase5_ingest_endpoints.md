@@ -86,15 +86,20 @@ TEMP_DOC_TTL_HOURS: ${TEMP_DOC_TTL_HOURS:-24}
 ```
 
 **処理フロー:**
-1. **期限切れ一時データのクリーンアップ**（毎回実行）
+1. **期限切れ一時データのクリーンアップ**（毎回実行・物理削除）
    - ES: `expires_at < now` かつ `scope=temporary` のドキュメントを `delete_by_query`
-   - Neo4j: 同条件の Chunk・Document を削除
+   - Neo4j: 同条件の Chunk・MENTIONS エッジ・Document を削除
    - コンテナ内の一時領域（`/tmp/graphrag_temp/`）のファイルも削除
 2. ファイルを `/tmp/graphrag_temp/` に一時保存
 3. `document_id = "tmp-{uuid8}-{stem}"` を生成（`uuid8` は UUID の先頭8文字）
 4. 拡張子を判定して `build_*_payload()` を呼び出す
 5. payload に `scope="temporary"`, `expires_at=now+TTL` を追加
 6. ES・Neo4j に書き込む（`scope` と `expires_at` は両方に保存）
+
+**期限切れ temporary のクエリ時フィルタ（cleanup とは独立）:**
+- `/documents` も `/search` も `expires_at IS NULL OR expires_at > now` を常にクエリ条件に付与する
+- 物理削除（cleanup）が未実行でも、期限切れ temporary はレスポンスに一切含めない
+- `?scope=all` を指定した場合も例外なく除外する
 
 **対応拡張子:** `.pdf`, `.md`, `.txt` / 非対応: 400 Bad Request
 
@@ -117,12 +122,17 @@ TEMP_DOC_TTL_HOURS: ${TEMP_DOC_TTL_HOURS:-24}
 }
 ```
 
-**scope による分岐:**
+**scope × source による分岐:**
 
-| scope | ES/Neo4j | ファイル削除 | Git |
-|-------|----------|------------|-----|
-| `official` | 削除 | `input/<source_ref>` を削除 | Phase 5c で対応 |
-| `temporary` | 削除 | `/tmp/graphrag_temp/` のファイルを削除 | なし |
+| scope | source | ES/Neo4j | ファイル削除 | Git |
+|-------|--------|----------|------------|-----|
+| `official` | `pdf`/`md`/`txt` | 削除 | `input/<source_ref>` を削除 | Phase 5c で対応 |
+| `official` | `growi` | 削除 | なし（Growi 本体が正本のため） | なし |
+| `temporary` | 任意 | 削除 | `/tmp/graphrag_temp/` のファイルを削除 | なし |
+
+**official growi の削除について:**
+Growi 本体が正本であり、GraphRAG 側が Growi のデータを削除する権限を持たない。
+ES・Neo4j からインデックスを削除するのみ。
 
 **Neo4j 削除手順（scope 共通）:**
 ```cypher
@@ -180,6 +190,11 @@ class SearchRequest(BaseModel):
 1. **ES フィルタ**: `term: {scope: req.scope}` を追加（`scope=all` の場合はフィルタなし）
 2. **Neo4j seed Cypher**: `WHERE c.scope = $scope` を追加
 3. **Neo4j graph hit Cypher**: `WHERE related.scope = $scope` を追加
+
+**期限切れ temporary のクエリ時除外（検索でも適用）:**
+- ES フィルタに `expires_at IS NULL OR expires_at > now` を常に追加する
+- `scope=all` を指定しても期限切れ temporary は除外する（検索結果の信頼性を守る）
+- Neo4j の seed・graph hit Cypher にも `AND (c.expires_at IS NULL OR c.expires_at > $now)` を追加する
 
 ---
 
