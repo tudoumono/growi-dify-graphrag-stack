@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any
 
 
+
 def get_input_root() -> Path:
     """環境変数 INGEST_INPUT_ROOT を読んで Path を返す。未設定ならエラー終了。"""
     root = os.environ.get("INGEST_INPUT_ROOT")
@@ -213,12 +214,18 @@ def build_pdf_payload(
         sys.exit(1)
 
     # フォルダ構造情報を metadata に自動付与する
+    dir_str = str(relative.parent).replace("\\", "/")
+    if dir_str == ".":
+        dir_str = ""
     auto_metadata: dict[str, Any] = {
         "source_type": "pdf",
         "filename": pdf_path.name,
-        "dir": str(relative.parent) if str(relative.parent) != "." else "",
-        "path": str(relative),
+        "dir": dir_str,
+        "path": str(relative).replace("\\", "/"),
     }
+
+    # カテゴリ: 明示指定があれば優先、なければ親ディレクトリパスを自動推定
+    resolved_category = category or dir_str
 
     # payload は API 契約そのもの。
     # PDF 以外の入力元を増やす場合も、この形に合わせれば main.py 側は再利用できる。
@@ -226,13 +233,12 @@ def build_pdf_payload(
         "document_id": document_id,
         "title": title or pdf_path.stem,
         "url": "",
-        "source_ref": str(relative),
+        "source_ref": str(relative).replace("\\", "/"),
         "text": text,
         "source": "pdf",
+        "category": resolved_category or None,
         "metadata": auto_metadata,
     }
-    if category:
-        payload["category"] = category
     if language:
         payload["language"] = language
 
@@ -272,24 +278,28 @@ def build_markdown_payload(
         print(f"テキストが空です: {md_path}", file=sys.stderr)
         sys.exit(1)
 
+    dir_str = str(relative.parent).replace("\\", "/")
+    if dir_str == ".":
+        dir_str = ""
     auto_metadata: dict[str, Any] = {
         "source_type": "markdown",
         "filename": md_path.name,
-        "dir": str(relative.parent) if str(relative.parent) != "." else "",
-        "path": str(relative),
+        "dir": dir_str,
+        "path": str(relative).replace("\\", "/"),
     }
+
+    resolved_category = category or dir_str
 
     payload: dict[str, Any] = {
         "document_id": document_id,
         "title": title or md_path.stem,
         "url": "",
-        "source_ref": str(relative),
+        "source_ref": str(relative).replace("\\", "/"),
         "text": text,
         "source": "markdown",
+        "category": resolved_category or None,
         "metadata": auto_metadata,
     }
-    if category:
-        payload["category"] = category
     if language:
         payload["language"] = language
 
@@ -324,24 +334,28 @@ def build_txt_payload(
         print(f"テキストが空です: {txt_path}", file=sys.stderr)
         sys.exit(1)
 
+    dir_str = str(relative.parent).replace("\\", "/")
+    if dir_str == ".":
+        dir_str = ""
     auto_metadata: dict[str, Any] = {
         "source_type": "txt",
         "filename": txt_path.name,
-        "dir": str(relative.parent) if str(relative.parent) != "." else "",
-        "path": str(relative),
+        "dir": dir_str,
+        "path": str(relative).replace("\\", "/"),
     }
+
+    resolved_category = category or dir_str
 
     payload: dict[str, Any] = {
         "document_id": document_id,
         "title": title or txt_path.stem,
         "url": "",
-        "source_ref": str(relative),
+        "source_ref": str(relative).replace("\\", "/"),
         "text": text,
         "source": "txt",
+        "category": resolved_category or None,
         "metadata": auto_metadata,
     }
-    if category:
-        payload["category"] = category
     if language:
         payload["language"] = language
 
@@ -403,6 +417,42 @@ def cmd_txt(args: argparse.Namespace) -> None:
     send_and_print(args.graphrag_url, payload)
 
 
+def cmd_input_dir(args: argparse.Namespace) -> None:
+    # input-dir 取り込みの全体順:
+    # 1. INGEST_INPUT_ROOT 配下を再帰スキャンして対応ファイルを列挙する
+    # 2. 未対応拡張子はスキップして警告を出す
+    # 3. 各ファイルを拡張子に応じた build_*_payload() で処理して送信する
+    input_root = get_input_root()
+    supported = {".pdf", ".md", ".txt"}
+
+    all_files = sorted(f for f in input_root.rglob("*") if f.is_file())
+    targets = []
+    for f in all_files:
+        if f.suffix.lower() in supported:
+            targets.append(f)
+        else:
+            print(f"[スキップ] 未対応形式: {f.relative_to(input_root)}", file=sys.stderr)
+
+    if not targets:
+        print("取り込み対象のファイルが見つかりませんでした。", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"{len(targets)} ファイルを取り込みます...")
+    for f in targets:
+        ext = f.suffix.lower()
+        try:
+            if ext == ".pdf":
+                payload = build_pdf_payload(f, input_root)
+            elif ext == ".md":
+                payload = build_markdown_payload(f, input_root)
+            elif ext == ".txt":
+                payload = build_txt_payload(f, input_root)
+            send_and_print(args.graphrag_url, payload)
+        except SystemExit:
+            # 個別ファイルのエラーは警告に留めて次のファイルへ進む
+            print(f"[エラー] {f.relative_to(input_root)} をスキップしました", file=sys.stderr)
+
+
 def main() -> None:
     # CLI の入口。
     # まず共通オプションを定義し、その後に入力元ごとのサブコマンドを分ける。
@@ -444,6 +494,9 @@ def main() -> None:
     txt_parser.add_argument("--category", help="GraphRAG 側のカテゴリ")
     txt_parser.add_argument("--language", help="ドキュメント言語 (例: ja)")
 
+    # input-dir サブコマンド
+    subparsers.add_parser("input-dir", help="INGEST_INPUT_ROOT 配下を一括取り込む")
+
     args = parser.parse_args()
 
     if args.command == "growi":
@@ -454,6 +507,8 @@ def main() -> None:
         cmd_md(args)
     elif args.command == "txt":
         cmd_txt(args)
+    elif args.command == "input-dir":
+        cmd_input_dir(args)
 
 
 if __name__ == "__main__":

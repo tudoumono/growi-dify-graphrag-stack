@@ -136,10 +136,35 @@ Phase 1 が完了すると、「何が、どこから来たか」がデータか
 | content_hash スキップ | `ingest.py`, `main.py` | LLM 再処理コストを削減する |
 | directory 一括取り込み | `ingest.py` | 手動実行の手間をなくす |
 
-### Phase 4: パイプライン連携（将来検討）
+### Phase 4: ingest.py 廃止・サーバー側取り込みへ移行
 
-`tmp/files/` に置かれた前処理済み Markdown を自動的に GraphRAG に流す仕組み。
-Phase 3 までの設計が固まってから具体化する。
+**背景と判断:**
+`ingest.py` は「ファイルを読んで POST /ingest を叩くクライアント」であり、
+`main.py` の `/ingest` 実装そのものではない。
+将来の定期実行・ファイル監視への自動化を考えると、コンテナ内で直接処理する方が自然。
+そのため `ingest.py` は一時的なツールと位置づけ、Phase 4 で廃止する。
+
+**やること:**
+
+| 対象 | 変更内容 |
+|------|---------|
+| `main.py` | `/ingest-dir` エンドポイントを追加。コンテナ内の `input/` を直接スキャン・取り込む |
+| `main.py` | ファイル監視（watchdog 等）や定期実行（cron）への対応 |
+| `ingest.py` | 廃止 |
+| `docker-compose.yml` | `input/` マウントは Phase 3 で追加済み。定期実行設定をここに追加 |
+
+**現状（Phase 3 完了時点）の運用:**
+```bash
+docker exec graphrag-api python ingest.py input-dir
+```
+
+**Phase 4 完了後の運用（予定）:**
+```bash
+# 手動トリガー
+curl -X POST http://localhost:8080/ingest-dir
+
+# 将来: cron やファイル監視で自動実行
+```
 
 ---
 

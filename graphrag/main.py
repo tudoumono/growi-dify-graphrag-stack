@@ -22,6 +22,7 @@ from __future__ import annotations
 # logging: エラーや起動情報をログに出す
 # os: 環境変数から接続先やモデル設定を読む
 # Any: 「いろいろな型が入る」ことを型ヒントで表す
+import hashlib
 import json
 import logging
 import os
@@ -171,7 +172,26 @@ def ensure_es_index(es: Elasticsearch) -> None:
     # ES 側には「チャンク本文」と「ベクトル」を保存する。
     # 特に embedding.dims は埋め込みモデルと一致している必要がある。
     # ここを変えた場合は、既存インデックスを作り直して再取り込みが必要。
+    #
+    # category フィールドは path_hierarchy tokenizer で階層分解してインデックスする。
+    # 例: "contracts/nda" → "contracts" と "contracts/nda" の両方でヒットするようになる。
+    # prefix クエリ不要で term クエリのまま高速に階層検索できる。
     mapping = {
+        "settings": {
+            "analysis": {
+                "analyzer": {
+                    "path_analyzer": {
+                        "tokenizer": "path_tokenizer"
+                    }
+                },
+                "tokenizer": {
+                    "path_tokenizer": {
+                        "type": "path_hierarchy",
+                        "delimiter": "/"
+                    }
+                }
+            }
+        },
         "mappings": {
             "properties": {
                 "chunk_id": {"type": "keyword"},
@@ -181,7 +201,13 @@ def ensure_es_index(es: Elasticsearch) -> None:
                 "url": {"type": "keyword"},
                 "source_ref": {"type": "keyword"},
                 "chunk_index": {"type": "integer"},
-                "category": {"type": "keyword"},
+                "category": {
+                    "type": "text",
+                    "analyzer": "path_analyzer",
+                    "fields": {
+                        "keyword": {"type": "keyword"}
+                    }
+                },
                 "source": {"type": "keyword"},
                 "tags": {"type": "keyword"},
                 "language": {"type": "keyword"},
@@ -306,7 +332,7 @@ class ProviderInfo(BaseModel):
     chunk_overlap: int
 
 
-def document_properties(req: IngestRequest) -> dict[str, Any]:
+def document_properties(req: IngestRequest, content_hash: str) -> dict[str, Any]:
     # None を含めて全フィールドを返す: SET d = $props で完全置き換えするため
     # Document ノード用のプロパティを 1 箇所で組み立てる関数。
     # 将来、文書単位の属性を増やすならまずここを触る。
@@ -322,6 +348,7 @@ def document_properties(req: IngestRequest) -> dict[str, Any]:
         "created_at": req.created_at,
         "updated_at": req.updated_at,
         "metadata_json": metadata_json(req.metadata),
+        "content_hash": content_hash,
     }
 
 
@@ -525,8 +552,10 @@ def ingest(req: IngestRequest) -> dict[str, Any]:
     """
     ドキュメントを ES（ベクトル）と Neo4j（グラフ）へ取り込む。
     同じ document_id で再取り込みした場合、不要になった古いチャンクは削除される。
+    content_hash が一致する場合はスキップして即座に返す。
 
     処理の順番:
+    0. content_hash を計算し、未変更なら即座にスキップして返す
     1. ES インデックスがなければ作成する
     2. 文書本文を chunk に分割する
     3. Document ノードを作成または更新する
@@ -545,13 +574,41 @@ def ingest(req: IngestRequest) -> dict[str, Any]:
     - 性能を変えたい: LLM 呼び出し回数、ES の k 値、Neo4j 探索範囲
     - 整合性を変えたい: 再取り込み時の削除順と失敗時の復旧方針
     """
+    # Step 0. content_hash を計算して未変更チェックを行う
+    content_hash = hashlib.sha256(req.text.encode("utf-8")).hexdigest()
+    skip_driver = get_neo4j_driver()
+    try:
+        with skip_driver.session() as session:
+            result = session.run(
+                "MATCH (d:Document {id: $id}) RETURN d.content_hash AS hash",
+                id=req.document_id,
+            )
+            record = result.single()
+            if record and record["hash"] == content_hash:
+                existing = session.run(
+                    "MATCH (d:Document {id: $id})-[:HAS_CHUNK]->(c:Chunk) "
+                    "RETURN c.id AS chunk_id ORDER BY c.chunk_index",
+                    id=req.document_id,
+                )
+                chunk_ids = [r["chunk_id"] for r in existing]
+                logger.info("スキップ (未変更): %s", req.document_id)
+                return {
+                    "document_id": req.document_id,
+                    "chunks_stored": 0,
+                    "chunk_ids": chunk_ids,
+                    "skipped": True,
+                    "reason": "content unchanged",
+                }
+    finally:
+        skip_driver.close()
+
     es = get_es_client()
     ensure_es_index(es)
     driver = get_neo4j_driver()
     chunks = chunk_document(req)
     new_chunk_count = len(chunks)
     stored_chunks: list[str] = []
-    doc_props = document_properties(req)
+    doc_props = document_properties(req, content_hash)
 
     try:
         with driver.session() as session:

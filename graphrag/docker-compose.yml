@@ -87,7 +87,9 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - ${HOME}/.aws:/root/.aws:ro
+      - ${INGEST_INPUT_ROOT:-../input}:/input:ro
     environment:
+      INGEST_INPUT_ROOT: /input
       ELASTICSEARCH_HOST: graphrag-es
       ELASTICSEARCH_PORT: "9200"
       ELASTICSEARCH_USERNAME: elastic
