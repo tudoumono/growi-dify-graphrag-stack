@@ -89,12 +89,16 @@ TEMP_DOC_TTL_HOURS: ${TEMP_DOC_TTL_HOURS:-24}
 1. **期限切れ一時データのクリーンアップ**（毎回実行・物理削除）
    - ES: `expires_at < now` かつ `scope=temporary` のドキュメントを `delete_by_query`
    - Neo4j: 同条件の Chunk・MENTIONS エッジ・Document を削除
-   - コンテナ内の一時領域（`/tmp/graphrag_temp/`）のファイルも削除
-2. ファイルを `/tmp/graphrag_temp/` に一時保存
-3. `document_id = "tmp-{uuid8}-{stem}"` を生成（`uuid8` は UUID の先頭8文字）
-4. 拡張子を判定して `build_*_payload()` を呼び出す
-5. payload に `scope="temporary"`, `expires_at=now+TTL` を追加
-6. ES・Neo4j に書き込む（`scope` と `expires_at` は両方に保存）
+   - `/tmp/graphrag_temp/` 内の対応ファイルも削除（`metadata.temp_file_path` を参照）
+2. ファイルを `/tmp/graphrag_temp/{uuid8}_{filename}` に保存
+3. `uuid8 = uuid.uuid4().hex[:8]` を生成
+4. 拡張子を判定して `build_*_payload(path=temp_path, input_root=/tmp/graphrag_temp/)` を呼び出す
+5. **document_id を上書き**: `payload["document_id"] = f"tmp-{uuid8}-{stem}"`
+   - `build_*_payload()` は `input_root` 相対パスから `{ext}-{stem}` 形式で document_id を生成するが、
+     一時ファイルは呼び出し側で上書きする（`build_*_payload()` 自体は変更しない）
+6. `metadata["temp_file_path"] = str(temp_path)` を追加（DELETE 時のファイル特定に使用）
+7. payload に `scope="temporary"`, `expires_at=now+TTL` を追加
+8. ES・Neo4j に書き込む（`scope`・`expires_at`・`temp_file_path` はすべて両方に保存）
 
 **期限切れ temporary のクエリ時フィルタ（cleanup とは独立）:**
 - `/documents` も `/search` も `expires_at IS NULL OR expires_at > now` を常にクエリ条件に付与する
@@ -128,7 +132,14 @@ TEMP_DOC_TTL_HOURS: ${TEMP_DOC_TTL_HOURS:-24}
 |-------|--------|----------|------------|-----|
 | `official` | `pdf`/`md`/`txt` | 削除 | `input/<source_ref>` を削除 | Phase 5c で対応 |
 | `official` | `growi` | 削除 | なし（Growi 本体が正本のため） | なし |
-| `temporary` | 任意 | 削除 | `/tmp/graphrag_temp/` のファイルを削除 | なし |
+| `temporary` | 任意 | 削除 | ES metadata の `temp_file_path` を参照して削除 | なし |
+
+**temporary のファイル削除:**
+```python
+# ES の metadata から temp_file_path を取得して削除
+temp_path = es_doc["metadata"]["temp_file_path"]
+Path(temp_path).unlink(missing_ok=True)  # 既に消えていても無視
+```
 
 **official growi の削除について:**
 Growi 本体が正本であり、GraphRAG 側が Growi のデータを削除する権限を持たない。
@@ -163,14 +174,63 @@ MATCH (d:Document {id: $document_id}) DELETE d
 }
 ```
 
-**処理フロー（official の場合）:**
+**処理フロー（official file: source=pdf/md/txt の場合）:**
 1. ES から `source_ref` を取得
 2. `INGEST_INPUT_ROOT/<source_ref>` のファイルを読んで `build_*_payload()` を呼び出す
-3. ES・Neo4j に書き込む（`scope="official"` で上書き）
+3. ES・Neo4j に書き込む（`scope="official"`, `expires_at=null` で上書き）
+
+**処理フロー（official growi の場合）:**
+1. ES の `metadata.growi_page_id` から page_id を取得
+   - `source_ref` 文字列解析は避ける（将来の変更に脆弱なため）
+2. `build_growi_payload(GROWI_URL, page_id, GROWI_API_KEY)` を呼び出す
+3. ES・Neo4j に書き込む（`scope="official"`, `expires_at=null` で上書き）
+4. GROWI_URL / GROWI_API_KEY が未設定の場合は 503 を返す
 
 **処理フロー（temporary の場合）:**
-1. `/tmp/graphrag_temp/` にファイルが残っている場合のみ再取り込み
-2. ファイルがない場合は 409 を返す（「一時ファイルは既に削除されています。再アップロードしてください」）
+1. ES の `metadata.temp_file_path` でファイルの存在を確認
+2. ファイルがない場合は 409 を返す
+   - `{"error": "temp_file_expired", "message": "一時ファイルは既に削除されています。再アップロードしてください"}`
+3. ファイルがある場合は再取り込み（`scope="temporary"`, `expires_at` を延長）
+
+---
+
+### エンドポイント: POST /ingest-growi
+
+Growi のページパスを UI 入力として受け取り、内部で page_id に解決してから official として取り込む。
+
+**リクエスト（JSON）:**
+```json
+{"page_path": "/docs/spec/system-design"}
+```
+
+**レスポンス（200 OK）:**
+```json
+{
+  "status": "ok",
+  "document_id": "growi-12345",
+  "page_id": "12345",
+  "scope": "official",
+  "skipped": false
+}
+```
+
+**処理フロー:**
+1. `GROWI_URL`・`GROWI_API_KEY` 環境変数を取得（未設定なら 503）
+2. Growi API `GET /_api/v3/pages?path=<page_path>` で `page_id` を取得（見つからなければ 404）
+3. `build_growi_payload(GROWI_URL, page_id, GROWI_API_KEY)` を呼び出す
+4. **`metadata["growi_page_id"] = page_id` を payload に追加する**
+   - `/reingest` での再取り込み時に `metadata.growi_page_id` を使って page_id を取得する
+   - `source_ref` 文字列解析（`"growi-12345".removeprefix("growi-")`）は将来の変更に脆弱なため使わない
+5. `scope="official"`, `expires_at=null` を付与
+6. ES・Neo4j に書き込む（ファイル操作・Git コミットなし）
+
+**エラーケース:**
+
+| HTTP | 条件 |
+|------|------|
+| 404 | page_path に一致するページが Growi に存在しない |
+| 503 | `GROWI_URL` または `GROWI_API_KEY` が未設定 |
+| 500 | Growi API への接続失敗 |
 
 ---
 
@@ -187,14 +247,31 @@ class SearchRequest(BaseModel):
 
 **scope フィルタを通す箇所（3か所）:**
 
-1. **ES フィルタ**: `term: {scope: req.scope}` を追加（`scope=all` の場合はフィルタなし）
-2. **Neo4j seed Cypher**: `WHERE c.scope = $scope` を追加
-3. **Neo4j graph hit Cypher**: `WHERE related.scope = $scope` を追加
+1. **ES フィルタ:**
+   ```python
+   # scope フィルタ（scope=all の場合は term フィルタを追加しない）
+   if req.scope != "all":
+       filters.append({"term": {"scope": req.scope}})
+   # expires_at フィルタ（scope に関わらず常に適用）
+   filters.append({"bool": {"should": [
+       {"bool": {"must_not": {"exists": {"field": "expires_at"}}}},
+       {"range": {"expires_at": {"gt": "now"}}}
+   ]}})
+   ```
 
-**期限切れ temporary のクエリ時除外（検索でも適用）:**
-- ES フィルタに `expires_at IS NULL OR expires_at > now` を常に追加する
-- `scope=all` を指定しても期限切れ temporary は除外する（検索結果の信頼性を守る）
-- Neo4j の seed・graph hit Cypher にも `AND (c.expires_at IS NULL OR c.expires_at > $now)` を追加する
+2. **Neo4j seed Cypher:**
+   ```cypher
+   WHERE ($scope = 'all' OR c.scope = $scope)
+     AND (c.expires_at IS NULL OR c.expires_at > $now)
+   ```
+
+3. **Neo4j graph hit Cypher:**
+   ```cypher
+   WHERE ($scope = 'all' OR related.scope = $scope)
+     AND (related.expires_at IS NULL OR related.expires_at > $now)
+   ```
+
+`scope=all` でも `expires_at` フィルタは**常に適用**する（期限切れは検索結果に出さない）。
 
 ---
 
