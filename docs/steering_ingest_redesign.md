@@ -109,14 +109,21 @@ API コストと処理時間の無駄が発生する。
   L: main.py に GET /documents エンドポイントを追加（ES/Neo4j 整合性チェック）
   M: ingest.py の input-dir サブコマンドを廃止
 
-[Phase 5] 管理UI・ファイル操作エンドポイント・ingest.py 廃止
-  N: input/ を Git リポジトリ化（事前準備）
-  O: docker-compose.yml の :ro → :rw 変更、Dockerfile に git インストール
-  P: main.py に POST /ingest-file エンドポイントを追加（アップロード + Git コミット）
-  Q: main.py に DELETE /documents/{document_id} エンドポイントを追加（削除 + Git コミット）
+[Phase 5a] 正式・一時 2系統ドキュメント管理
+  N: scope フィールドを ES・Neo4j 両方に追加（official / temporary）
+  O: main.py に POST /ingest-temp エンドポイントを追加（一時取り込み・TTL付き・input/に保存しない）
+  P: main.py に DELETE /documents/{document_id} エンドポイントを追加（scope で分岐）
+  Q: main.py に POST /documents/{id}/reingest エンドポイントを追加（整合性修復）
   R: main.py に POST /ingest-growi エンドポイントを追加（サーバー側 Growi 取り込み）
-  S: GET /ui ブラウザ管理画面を追加（一覧・アップロード・削除）
-  T: ingest.py を廃止
+  S: /search に scope フィルタを追加（SearchRequest・ES・Neo4j Cypher の3か所）
+
+[Phase 5b] 管理UI
+  T: GET /ui ブラウザ管理画面を追加（一覧・一時アップロード・削除・再取込・正式一括再同期）
+
+[Phase 5c] Git 自動コミット・ingest.py 廃止
+  U: docker-compose.yml の :ro → :rw 変更、Dockerfile に git インストール・commit identity 設定
+  V: DELETE /documents（official）に Git コミットを追加
+  W: ingest.py を廃止
 ```
 
 ---
@@ -186,36 +193,60 @@ curl http://localhost:8080/ingest-job/abc123
 curl http://localhost:8080/documents
 ```
 
-### Phase 5: 管理UI・ファイル操作エンドポイント・ingest.py 廃止
+### Phase 5: 正式・一時 2系統ドキュメント管理（5a/5b/5c）
 
-**背景と判断:**
-ブラウザからファイルをアップロード・削除でき、その操作が GraphRAG（ES + Neo4j）に即時反映される管理画面を提供する。
-ファイル操作の履歴管理と誤削除対策として `input/` を Git リポジトリで管理する。
-Phase 5 完了時に `ingest.py` を廃止し、全操作をエンドポイント経由に統一する。
+**設計方針（確定）:**
 
-**やること:**
+| 系統 | 正本 | 取り込み方法 | Git | 寿命 |
+|------|------|------------|-----|------|
+| 正式 | `input/` | `/ingest-dir` | あり（5c） | 永続 |
+| 一時 | なし | `/ingest-temp` | なし | TTL（デフォルト24h） |
+
+- `scope` フィールドを ES・Neo4j **両方**に保持（Neo4j の graph hit にも scope フィルタが必要）
+- `/search` ・`GET /documents` のデフォルトは `official` のみ
+- 昇格（一時→正式）は専用 API なし。`input/` にコピーして `/ingest-dir` で代替
+- TTL は環境変数 `TEMP_DOC_TTL_HOURS`（デフォルト: 24）で制御
+- 期限切れ一時データのクリーンアップは `/ingest-temp` 呼び出し時に毎回実行
+
+**Phase 5a やること:**
 
 | 対象 | 変更内容 |
 |------|---------|
-| `input/`（事前準備） | `git init` で Git リポジトリ化 |
-| `docker-compose.yml` | `input/` マウントを `:ro` → `:rw` に変更 |
-| `Dockerfile` | `git` をインストール |
-| `main.py` | `POST /ingest-file` を追加（アップロード → input/ 保存 → 取り込み → Git コミット） |
-| `main.py` | `DELETE /documents/{document_id}` を追加（ES/Neo4j 削除 → ファイル削除 → Git コミット） |
-| `main.py` | `POST /ingest-growi` を追加（サーバー側から Growi API を呼び出して取り込み） |
-| `main.py` | `GET /ui` を追加（ブラウザ管理画面：一覧・アップロード・削除） |
+| `main.py` | `scope` / `expires_at` フィールドを ES・Neo4j 両方の書き込みに追加 |
+| `main.py` | `POST /ingest-temp` を追加（一時取り込み・TTL付き・`/tmp` に保存・input/ に保存しない） |
+| `main.py` | `DELETE /documents/{id}` を追加（scope で削除対象を分岐） |
+| `main.py` | `POST /documents/{id}/reingest` を追加（mismatch 修復） |
+| `main.py` | `POST /ingest-growi` を追加（サーバー側 Growi API 呼び出し） |
+| `main.py` | `/search` に `scope` フィルタを追加（SearchRequest・ES・Neo4j Cypher の3か所） |
+| `requirements.txt` | `python-multipart>=0.0.9` を追加 |
+| `docker-compose.yml` | `TEMP_DOC_TTL_HOURS` 環境変数を追加 |
+
+**Phase 5b やること:**
+
+| 対象 | 変更内容 |
+|------|---------|
+| `main.py` | `GET /ui` を追加（一覧・一時アップロード・削除・再取込・正式一括再同期） |
+
+**Phase 5c やること:**
+
+| 対象 | 変更内容 |
+|------|---------|
+| `docker-compose.yml` | `input/` マウントを `:ro` → `:rw`、`.git` マウントを追加 |
+| `Dockerfile` | `git` インストール・commit identity 環境変数を設定 |
+| `main.py` | `DELETE /documents`（official）に Git コミットを追加 |
 | `ingest.py` | 廃止 |
 
 **Phase 5 完了後の運用:**
 ```bash
-# ブラウザで管理画面を開く
-http://localhost:8080/ui
-# → ファイルのドラッグ&ドロップでアップロード・取り込み
-# → 削除ボタンで ES/Neo4j とファイルを同時削除
-# → 一覧で ES/Neo4j の整合性を確認
+# 一時取り込み（検証・プレビュー用）
+curl -X POST http://localhost:8080/ingest-temp -F "file=@proposal.pdf"
 
-# ファイル操作の Git 履歴確認（ホスト側）
-cd /root/mywork/DIfy_Growi_Langfuse/input && git log --oneline
+# 正式登録フロー
+cp ~/Downloads/contract.pdf /root/mywork/DIfy_Growi_Langfuse/input/contracts/
+curl -X POST http://localhost:8080/ingest-dir
+
+# ブラウザで管理画面
+http://localhost:8080/ui
 ```
 
 ---
@@ -243,5 +274,5 @@ document_id はその配下からの相対パスで生成する。
 
 - Phase 1〜3 実装・動作確認 完了（2026-03-24）
 - Phase 4 スペック確定（2026-03-24）→ 実装待ち
-- Phase 5 スペック確定（2026-03-24）→ Phase 4 完了後に着手
+- Phase 5a/5b/5c スペック確定（2026-03-24）→ Phase 4 完了後に順次着手
 - 現在の運用: `docker exec graphrag-api python ingest.py input-dir`
