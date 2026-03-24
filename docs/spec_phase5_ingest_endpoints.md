@@ -126,18 +126,24 @@ TEMP_DOC_TTL_HOURS: ${TEMP_DOC_TTL_HOURS:-24}
 }
 ```
 
-**scope × source による分岐:**
+**scope × source による分岐（Phase 5a 時点）:**
 
 | scope | source | ES/Neo4j | ファイル削除 | Git |
 |-------|--------|----------|------------|-----|
-| `official` | `pdf`/`md`/`txt` | 削除 | `input/<source_ref>` を削除 | Phase 5c で対応 |
+| `official` | `pdf`/`md`/`txt` | 削除 | **なし（P5a では行わない）** | なし |
 | `official` | `growi` | 削除 | なし（Growi 本体が正本のため） | なし |
-| `temporary` | 任意 | 削除 | ES metadata の `temp_file_path` を参照して削除 | なし |
+| `temporary` | 任意 | 削除 | `/tmp/graphrag_temp/` の temp ファイルを削除 | なし |
+
+**official file の物理削除は Phase 5c に後ろ倒し（理由）:**
+- `input/` の `:rw` マウントと Git コミットは Phase 5c で対応する
+- P5a 時点では `input/` は `:ro` マウントのままであるため、コンテナからファイルを削除できない
+- P5a の DELETE official file はインデックス（ES/Neo4j）のみ削除し、`input/` のファイルは残る
+- Phase 5c 実装後に `:rw` + Git コミット付きのファイル削除が追加される
 
 **temporary のファイル削除:**
 ```python
 # ES の metadata から temp_file_path を取得して削除
-temp_path = es_doc["metadata"]["temp_file_path"]
+temp_path = es_doc["_source"]["metadata"]["temp_file_path"]
 Path(temp_path).unlink(missing_ok=True)  # 既に消えていても無視
 ```
 
