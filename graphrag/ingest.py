@@ -417,41 +417,6 @@ def cmd_txt(args: argparse.Namespace) -> None:
     send_and_print(args.graphrag_url, payload)
 
 
-def cmd_input_dir(args: argparse.Namespace) -> None:
-    # input-dir 取り込みの全体順:
-    # 1. INGEST_INPUT_ROOT 配下を再帰スキャンして対応ファイルを列挙する
-    # 2. 未対応拡張子はスキップして警告を出す
-    # 3. 各ファイルを拡張子に応じた build_*_payload() で処理して送信する
-    input_root = get_input_root()
-    supported = {".pdf", ".md", ".txt"}
-
-    all_files = sorted(f for f in input_root.rglob("*") if f.is_file())
-    targets = []
-    for f in all_files:
-        if f.suffix.lower() in supported:
-            targets.append(f)
-        else:
-            print(f"[スキップ] 未対応形式: {f.relative_to(input_root)}", file=sys.stderr)
-
-    if not targets:
-        print("取り込み対象のファイルが見つかりませんでした。", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"{len(targets)} ファイルを取り込みます...")
-    for f in targets:
-        ext = f.suffix.lower()
-        try:
-            if ext == ".pdf":
-                payload = build_pdf_payload(f, input_root)
-            elif ext == ".md":
-                payload = build_markdown_payload(f, input_root)
-            elif ext == ".txt":
-                payload = build_txt_payload(f, input_root)
-            send_and_print(args.graphrag_url, payload)
-        except SystemExit:
-            # 個別ファイルのエラーは警告に留めて次のファイルへ進む
-            print(f"[エラー] {f.relative_to(input_root)} をスキップしました", file=sys.stderr)
-
 
 def main() -> None:
     # CLI の入口。
@@ -494,9 +459,6 @@ def main() -> None:
     txt_parser.add_argument("--category", help="GraphRAG 側のカテゴリ")
     txt_parser.add_argument("--language", help="ドキュメント言語 (例: ja)")
 
-    # input-dir サブコマンド
-    subparsers.add_parser("input-dir", help="INGEST_INPUT_ROOT 配下を一括取り込む")
-
     args = parser.parse_args()
 
     if args.command == "growi":
@@ -507,8 +469,6 @@ def main() -> None:
         cmd_md(args)
     elif args.command == "txt":
         cmd_txt(args)
-    elif args.command == "input-dir":
-        cmd_input_dir(args)
 
 
 if __name__ == "__main__":

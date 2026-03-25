@@ -26,6 +26,9 @@ import hashlib
 import json
 import logging
 import os
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 # 外部ライブラリ。
@@ -36,7 +39,7 @@ from typing import Any
 # GraphDatabase: Neo4j 接続ドライバー生成
 # BaseModel / Field: API の入出力データ構造を定義
 from elasticsearch import Elasticsearch
-from fastapi import FastAPI, Query, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from neo4j import GraphDatabase
@@ -77,6 +80,11 @@ NEO4J_PASS = os.environ["NEO4J_PASSWORD"]
 
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "800"))
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "120"))
+INGEST_INPUT_ROOT = os.environ.get("INGEST_INPUT_ROOT", "/input")
+
+# ジョブ管理テーブル（単一プロセス前提のインメモリ dict）
+# 将来 --workers N 等の複数プロセス構成にする場合は Redis 等の外部ストアへ移行する
+jobs: dict[str, dict] = {}
 
 _embed_provider: EmbedProvider | None = None
 _llm_provider: LLMProvider | None = None
@@ -208,6 +216,11 @@ def ensure_es_index(es: Elasticsearch) -> None:
                         "keyword": {"type": "keyword"}
                     }
                 },
+                "scope": {"type": "keyword"},
+                "expires_at": {
+                    "type": "date",
+                    "format": "strict_date_optional_time||epoch_millis",
+                },
                 "source": {"type": "keyword"},
                 "tags": {"type": "keyword"},
                 "language": {"type": "keyword"},
@@ -300,6 +313,10 @@ class IngestRequest(BaseModel):
     created_at: str | None = None
     updated_at: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    # scope: "official"（input/ 正本）または "temporary"（/tmp 一時）
+    scope: str = "official"
+    # expires_at: temporary 時のみ設定。UTC ISO8601 文字列（例: "2026-03-25T10:00:00Z"）
+    expires_at: str | None = None
 
 
 class Citation(BaseModel):
@@ -349,6 +366,8 @@ def document_properties(req: IngestRequest, content_hash: str) -> dict[str, Any]
         "updated_at": req.updated_at,
         "metadata_json": metadata_json(req.metadata),
         "content_hash": content_hash,
+        "scope": req.scope,
+        "expires_at": req.expires_at,
     }
 
 
@@ -655,6 +674,8 @@ def ingest(req: IngestRequest) -> dict[str, Any]:
                         "updated_at": req.updated_at,
                         "metadata": req.metadata or None,
                         "embedding": embedding,
+                        "scope": req.scope,
+                        "expires_at": req.expires_at,
                     }
                 )
                 es.index(index=ES_INDEX, id=chunk_id, document=chunk_props)
@@ -674,6 +695,8 @@ def ingest(req: IngestRequest) -> dict[str, Any]:
                     "created_at": req.created_at,
                     "updated_at": req.updated_at,
                     "metadata_json": metadata_json(req.metadata),
+                    "scope": req.scope,
+                    "expires_at": req.expires_at,
                 }
                 session.run(
                     "MERGE (c:Chunk {id: $id}) "
@@ -798,3 +821,234 @@ def search_get(
             language=language,
         )
     )
+
+
+def run_ingest_dir(job_id: str) -> None:
+    """input/ ディレクトリをスキャンして各ファイルを取り込む（BackgroundTasks で実行）。
+
+    処理の順番:
+    1. INGEST_INPUT_ROOT 配下を再帰スキャン
+    2. 対象拡張子（.pdf/.md/.txt）ごとに build_*_payload() を呼ぶ
+    3. scope="official", expires_at=None を付与して IngestRequest 化
+    4. ingest() 内部ロジックを直接呼び出す（HTTP は介さない）
+    5. processed / skipped / failed をカウントしてジョブを更新
+    """
+    # ingest.py の build_*_payload() を利用する。
+    # sys.exit(1) が残っているため SystemExit をキャッチして失敗扱いにする。
+    # Phase 5a で build_*_payload() が ValueError/RuntimeError に移行後、このキャッチは削除する。
+    from ingest import build_markdown_payload, build_pdf_payload, build_txt_payload
+
+    input_root = Path(INGEST_INPUT_ROOT).resolve()
+    if not input_root.exists():
+        jobs[job_id].update({
+            "status": "failed",
+            "finished_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "errors": [f"INGEST_INPUT_ROOT が存在しません: {input_root}"],
+        })
+        return
+
+    processed = 0
+    skipped = 0
+    failed = 0
+    errors: list[str] = []
+
+    supported = {".pdf", ".md", ".txt"}
+    all_files = sorted(f for f in input_root.rglob("*") if f.is_file())
+    targets = [f for f in all_files if f.suffix.lower() in supported]
+
+    for f in targets:
+        ext = f.suffix.lower()
+        try:
+            if ext == ".pdf":
+                payload = build_pdf_payload(f, input_root)
+            elif ext == ".md":
+                payload = build_markdown_payload(f, input_root)
+            elif ext == ".txt":
+                payload = build_txt_payload(f, input_root)
+            else:
+                skipped += 1
+                continue
+
+            payload["scope"] = "official"
+            payload["expires_at"] = None
+
+            result = ingest(IngestRequest(**payload))
+            if result.get("skipped"):
+                skipped += 1
+            else:
+                processed += 1
+        except SystemExit:
+            # build_*_payload() の sys.exit(1) をキャッチ（Phase 5a でリファクタ予定）
+            failed += 1
+            errors.append(f"失敗: {f.name}")
+        except Exception as exc:
+            failed += 1
+            errors.append(f"{f.name}: {exc}")
+            logger.warning("ingest-dir ファイル処理エラー: %s %s", f, exc)
+
+        # 進捗をジョブに随時反映
+        jobs[job_id].update({"processed": processed, "skipped": skipped, "failed": failed})
+
+    jobs[job_id].update({
+        "status": "done",
+        "finished_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "processed": processed,
+        "skipped": skipped,
+        "failed": failed,
+        "errors": errors,
+    })
+    logger.info("ingest-dir 完了: job_id=%s processed=%d skipped=%d failed=%d", job_id, processed, skipped, failed)
+
+
+@app.post("/ingest-dir", status_code=202)
+def ingest_dir_start(background_tasks: BackgroundTasks) -> dict[str, Any]:
+    """input/ ディレクトリを非同期スキャンして取り込みを開始する。
+
+    同時実行制御: 実行中ジョブが存在する場合は 409 Conflict を返す。
+    ジョブ管理: jobs dict（インメモリ）で状態を保持。再起動でリセットされる。
+    """
+    # 1時間以上前のジョブをクリーンアップ
+    cutoff_ts = datetime.now(timezone.utc).timestamp() - 3600
+    stale = [jid for jid, job in jobs.items() if job.get("created_at_ts", 0) < cutoff_ts]
+    for jid in stale:
+        del jobs[jid]
+
+    # 実行中チェック → 409
+    running = [jid for jid, job in jobs.items() if job["status"] == "running"]
+    if running:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "job_already_running", "running_job_id": running[0]},
+        )
+
+    job_id = str(uuid.uuid4())
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    jobs[job_id] = {
+        "job_id": job_id,
+        "status": "running",
+        "started_at": now_str,
+        "finished_at": None,
+        "processed": 0,
+        "skipped": 0,
+        "failed": 0,
+        "errors": [],
+        "created_at_ts": datetime.now(timezone.utc).timestamp(),
+    }
+    background_tasks.add_task(run_ingest_dir, job_id)
+
+    return {"job_id": job_id, "status": "running", "message": "ingest-dir started"}
+
+
+@app.get("/ingest-job/{job_id}")
+def get_ingest_job(job_id: str) -> dict[str, Any]:
+    """ジョブ状態を返す。存在しない job_id は 404 を返す。"""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail={"error": "job_not_found"})
+    job = jobs[job_id]
+    return {
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "started_at": job["started_at"],
+        "finished_at": job.get("finished_at"),
+        "processed": job["processed"],
+        "skipped": job["skipped"],
+        "failed": job["failed"],
+        "errors": job.get("errors", []),
+    }
+
+
+@app.get("/documents")
+def list_documents(
+    scope: str = Query("official"),
+) -> list[dict[str, Any]]:
+    """ES と Neo4j の両方を突合してドキュメント一覧を返す。
+
+    scope パラメータ: "official" / "temporary" / "all"
+    期限切れ temporary は常に除外（クリーンアップ前でも同様）。
+    status: "ok"（両方に存在）/ "mismatch"（どちらか片方のみ）
+    """
+    if scope not in ("official", "temporary", "all"):
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_scope", "allowed": ["official", "temporary", "all"]},
+        )
+
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # --- ES: document_id を collapse で 1件/document に絞り込む ---
+    es = get_es_client()
+    ensure_es_index(es)
+
+    # expires_at IS NULL OR expires_at > now を常に適用
+    es_filters: list[dict[str, Any]] = [
+        {
+            "bool": {
+                "should": [
+                    {"bool": {"must_not": {"exists": {"field": "expires_at"}}}},
+                    {"range": {"expires_at": {"gt": now_str}}},
+                ],
+                "minimum_should_match": 1,
+            }
+        }
+    ]
+    if scope != "all":
+        es_filters.append({"term": {"scope": scope}})
+
+    es_resp = es.search(
+        index=ES_INDEX,
+        body={
+            "query": {"bool": {"filter": es_filters}},
+            "collapse": {"field": "document_id"},
+            "_source": ["document_id", "scope", "expires_at", "source_ref", "category"],
+            "size": 1000,
+        },
+    )
+
+    es_docs: dict[str, dict[str, Any]] = {}
+    for hit in es_resp["hits"]["hits"]:
+        src = hit["_source"]
+        doc_id = src["document_id"]
+        es_docs[doc_id] = {
+            "document_id": doc_id,
+            "source_ref": src.get("source_ref"),
+            "category": src.get("category"),
+            "scope": src.get("scope", "official"),
+            "expires_at": src.get("expires_at"),
+        }
+
+    # --- Neo4j: Document ノードを scope + expires_at フィルタ付きで取得 ---
+    neo4j_doc_ids: set[str] = set()
+    driver = get_neo4j_driver()
+    try:
+        with driver.session() as session:
+            result = session.run(
+                """
+                MATCH (d:Document)
+                WHERE ($scope = 'all' OR d.scope = $scope)
+                  AND (d.expires_at IS NULL OR d.expires_at > $now)
+                RETURN d.id AS document_id
+                """,
+                scope=scope,
+                now=now_str,
+            )
+            neo4j_doc_ids = {record["document_id"] for record in result}
+    finally:
+        driver.close()
+
+    # --- 突合して status を付与 ---
+    all_doc_ids = set(es_docs.keys()) | neo4j_doc_ids
+    result_list: list[dict[str, Any]] = []
+    for doc_id in sorted(all_doc_ids):
+        in_es = doc_id in es_docs
+        in_neo4j = doc_id in neo4j_doc_ids
+        status = "ok" if (in_es and in_neo4j) else "mismatch"
+
+        if in_es:
+            meta = es_docs[doc_id]
+        else:
+            # Neo4j にしか存在しない場合: document_id のみ、他フィールドは null
+            meta = {"document_id": doc_id, "source_ref": None, "category": None, "scope": None, "expires_at": None}
+
+        result_list.append({**meta, "in_es": in_es, "in_neo4j": in_neo4j, "status": status})
+
+    return result_list
