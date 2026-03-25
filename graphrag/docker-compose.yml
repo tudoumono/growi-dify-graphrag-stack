@@ -119,6 +119,10 @@ services:
 
       CHUNK_SIZE: ${CHUNK_SIZE:-800}
       CHUNK_OVERLAP: ${CHUNK_OVERLAP:-120}
+
+      TEMP_DOC_TTL_HOURS: ${TEMP_DOC_TTL_HOURS:-24}
+      GROWI_URL: ${GROWI_URL:-}
+      GROWI_API_KEY: ${GROWI_API_KEY:-}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 30s

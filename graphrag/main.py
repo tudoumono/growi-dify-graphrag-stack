@@ -26,8 +26,9 @@ import hashlib
 import json
 import logging
 import os
+import urllib.parse
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -39,7 +40,7 @@ from typing import Any
 # GraphDatabase: Neo4j 接続ドライバー生成
 # BaseModel / Field: API の入出力データ構造を定義
 from elasticsearch import Elasticsearch
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from neo4j import GraphDatabase
@@ -81,6 +82,9 @@ NEO4J_PASS = os.environ["NEO4J_PASSWORD"]
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "800"))
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "120"))
 INGEST_INPUT_ROOT = os.environ.get("INGEST_INPUT_ROOT", "/input")
+TEMP_DOC_TTL_HOURS = int(os.environ.get("TEMP_DOC_TTL_HOURS", "24"))
+GROWI_URL = os.environ.get("GROWI_URL", "")
+GROWI_API_KEY = os.environ.get("GROWI_API_KEY", "")
 
 # ジョブ管理テーブル（単一プロセス前提のインメモリ dict）
 # 将来 --workers N 等の複数プロセス構成にする場合は Redis 等の外部ストアへ移行する
@@ -328,10 +332,17 @@ class Citation(BaseModel):
 
 class SearchRequest(BaseModel):
     query: str
+    # scope: "official"（デフォルト）/ "temporary" / "all"
+    # 期限切れは scope に関わらず常に除外される
+    scope: str = "official"
     top_k: int = 5
     category: str | None = None
     source: str | None = None
     language: str | None = None
+
+
+class IngestGrowiRequest(BaseModel):
+    page_path: str
 
 
 class SearchResponse(BaseModel):
@@ -384,9 +395,22 @@ def chunk_document(req: IngestRequest) -> list[str]:
 
 
 def build_es_filters(req: SearchRequest) -> list[dict[str, Any]]:
-    # 検索時の category / source / language 条件を ES の filter 形式へ変換する。
-    # 検索対象を狭めたい要件を増やす場合はここに条件を足す。
+    # 検索時のフィルタを ES の filter 形式へ変換する。
+    # scope フィルタ: scope=all の場合は term フィルタを追加しない
+    # expires_at フィルタ: scope に関わらず常に適用（期限切れは検索結果に出さない）
     filters: list[dict[str, Any]] = []
+    if req.scope != "all":
+        filters.append({"term": {"scope": req.scope}})
+    # expires_at IS NULL OR expires_at > now
+    filters.append({
+        "bool": {
+            "should": [
+                {"bool": {"must_not": {"exists": {"field": "expires_at"}}}},
+                {"range": {"expires_at": {"gt": "now"}}},
+            ],
+            "minimum_should_match": 1,
+        }
+    })
     if req.category:
         filters.append({"term": {"category": req.category}})
     if req.source:
@@ -471,6 +495,7 @@ def _perform_search_inner(es: Elasticsearch, driver: Any, req: SearchRequest) ->
             # seed chunk -> Entity -> related chunk
             #
             # 将来「2 ホップ以上」にしたい場合はこの Cypher を拡張する。
+            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             result = session.run(
                 """
                 UNWIND $chunk_ids AS cid
@@ -478,6 +503,8 @@ def _perform_search_inner(es: Elasticsearch, driver: Any, req: SearchRequest) ->
                 WITH DISTINCT e LIMIT 20
                 MATCH (e)<-[:MENTIONS]-(related:Chunk)
                 WHERE NOT related.id IN $chunk_ids
+                  AND ($scope = 'all' OR related.scope = $scope)
+                  AND (related.expires_at IS NULL OR related.expires_at > $now)
                   AND ($category IS NULL OR related.category = $category)
                   AND ($source IS NULL OR related.source = $source)
                   AND ($language IS NULL OR related.language = $language)
@@ -496,6 +523,8 @@ def _perform_search_inner(es: Elasticsearch, driver: Any, req: SearchRequest) ->
                 LIMIT $limit
                 """,
                 chunk_ids=seed_chunk_ids,
+                scope=req.scope,
+                now=now_str,
                 category=req.category,
                 source=req.source,
                 language=req.language,
@@ -823,6 +852,164 @@ def search_get(
     )
 
 
+def cleanup_expired_temp() -> None:
+    """期限切れ temporary ドキュメントを ES・Neo4j・/tmp から物理削除する。
+    /ingest-temp 呼び出し時に毎回実行する。
+    """
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    es = get_es_client()
+
+    # --- 期限切れ temporary のドキュメントを ES から取得（ファイルパス参照に必要）---
+    try:
+        expired_resp = es.search(
+            index=ES_INDEX,
+            body={
+                "query": {
+                    "bool": {
+                        "filter": [
+                            {"term": {"scope": "temporary"}},
+                            {"range": {"expires_at": {"lte": now_str}}},
+                        ]
+                    }
+                },
+                "collapse": {"field": "document_id"},
+                "_source": ["document_id", "metadata"],
+                "size": 1000,
+            },
+        )
+        expired_docs = {
+            hit["_source"]["document_id"]: hit["_source"].get("metadata", {})
+            for hit in expired_resp["hits"]["hits"]
+        }
+    except Exception as exc:
+        logger.warning("cleanup_expired_temp: ES 検索エラー: %s", exc)
+        return
+
+    if not expired_docs:
+        return
+
+    # --- /tmp ファイルを削除 ---
+    for doc_id, metadata in expired_docs.items():
+        temp_path_str = metadata.get("temp_file_path")
+        if temp_path_str:
+            try:
+                Path(temp_path_str).unlink(missing_ok=True)
+            except Exception as exc:
+                logger.warning("cleanup_expired_temp: ファイル削除エラー %s: %s", temp_path_str, exc)
+
+    # --- ES: 期限切れ temporary を delete_by_query ---
+    try:
+        es.delete_by_query(
+            index=ES_INDEX,
+            body={
+                "query": {
+                    "bool": {
+                        "filter": [
+                            {"term": {"scope": "temporary"}},
+                            {"range": {"expires_at": {"lte": now_str}}},
+                        ]
+                    }
+                }
+            },
+        )
+    except Exception as exc:
+        logger.warning("cleanup_expired_temp: ES 削除エラー: %s", exc)
+
+    # --- Neo4j: 期限切れ temporary の Chunk・Document を削除 ---
+    driver = get_neo4j_driver()
+    try:
+        with driver.session() as session:
+            for doc_id in expired_docs:
+                session.run(
+                    "MATCH (c:Chunk {document_id: $id})-[r:MENTIONS]->() DELETE r",
+                    id=doc_id,
+                )
+                session.run(
+                    "MATCH (d:Document {id: $id})-[r:HAS_CHUNK]->(c:Chunk) DELETE r, c",
+                    id=doc_id,
+                )
+                session.run(
+                    "MATCH (d:Document {id: $id}) DELETE d",
+                    id=doc_id,
+                )
+    except Exception as exc:
+        logger.warning("cleanup_expired_temp: Neo4j 削除エラー: %s", exc)
+    finally:
+        driver.close()
+
+    logger.info("cleanup_expired_temp: %d 件の期限切れ temporary を削除しました", len(expired_docs))
+
+
+@app.post("/ingest-temp")
+async def ingest_temp(file: UploadFile = File(...)) -> dict[str, Any]:
+    """一時ファイルを取り込む。input/ には保存しない。TTL 後に自動削除される。
+
+    処理の順番:
+    1. 期限切れ temporary をクリーンアップ（毎回実行）
+    2. /tmp/graphrag_temp/ にファイルを保存
+    3. build_*_payload() で payload を生成
+    4. document_id を tmp-{uuid8}-{stem} に上書き
+    5. scope=temporary, expires_at=now+TTL を設定
+    6. ES・Neo4j に書き込む
+    """
+    filename = file.filename or "upload"
+    ext = Path(filename).suffix.lower()
+    if ext not in {".pdf", ".md", ".txt"}:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "unsupported_file_type", "allowed": [".pdf", ".md", ".txt"]},
+        )
+
+    # 期限切れ temporary をクリーンアップ
+    cleanup_expired_temp()
+
+    # /tmp/graphrag_temp/ にファイルを保存
+    temp_dir = Path("/tmp/graphrag_temp")
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    uuid8 = uuid.uuid4().hex[:8]
+    temp_path = temp_dir / f"{uuid8}_{filename}"
+    content = await file.read()
+    temp_path.write_bytes(content)
+
+    # build_*_payload() でペイロードを組み立てる（SystemExit はキャッチして 422 に変換）
+    from ingest import build_markdown_payload, build_pdf_payload, build_txt_payload
+    try:
+        if ext == ".pdf":
+            payload = build_pdf_payload(temp_path, temp_dir)
+        elif ext == ".md":
+            payload = build_markdown_payload(temp_path, temp_dir)
+        else:
+            payload = build_txt_payload(temp_path, temp_dir)
+    except SystemExit:
+        temp_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "file_parse_error", "message": "ファイルの解析に失敗しました"},
+        )
+
+    # document_id を一時ファイル用プレフィックスで上書き（build_*_payload() は変更しない）
+    stem = Path(filename).stem
+    payload["document_id"] = f"tmp-{uuid8}-{stem}"
+
+    # temp_file_path を metadata に追加（DELETE 時のファイル特定に使用）
+    payload.setdefault("metadata", {})["temp_file_path"] = str(temp_path)
+
+    # scope / expires_at を設定
+    expires_dt = datetime.now(timezone.utc) + timedelta(hours=TEMP_DOC_TTL_HOURS)
+    payload["scope"] = "temporary"
+    payload["expires_at"] = expires_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    result = ingest(IngestRequest(**payload))
+
+    return {
+        "status": "ok",
+        "document_id": payload["document_id"],
+        "scope": "temporary",
+        "expires_at": payload["expires_at"],
+        "skipped": result.get("skipped", False),
+    }
+
+
 def run_ingest_dir(job_id: str) -> None:
     """input/ ディレクトリをスキャンして各ファイルを取り込む（BackgroundTasks で実行）。
 
@@ -954,6 +1141,295 @@ def get_ingest_job(job_id: str) -> dict[str, Any]:
         "skipped": job["skipped"],
         "failed": job["failed"],
         "errors": job.get("errors", []),
+    }
+
+
+@app.delete("/documents/{document_id}")
+def delete_document(document_id: str) -> dict[str, Any]:
+    """ドキュメントを ES・Neo4j から削除する。scope × source で挙動が異なる。
+
+    - official file: ES/Neo4j のみ削除（:ro マウントのためファイル削除は Phase 5c）
+    - official growi: ES/Neo4j のみ削除（Growi 本体が正本のためファイル削除しない）
+    - temporary: ES/Neo4j に加えて /tmp の一時ファイルも削除
+    """
+    es = get_es_client()
+
+    # ドキュメント存在確認（ES から scope・source・metadata を取得）
+    try:
+        resp = es.search(
+            index=ES_INDEX,
+            body={
+                "query": {"term": {"document_id": document_id}},
+                "collapse": {"field": "document_id"},
+                "_source": ["document_id", "scope", "source", "metadata"],
+                "size": 1,
+            },
+        )
+        es_hit = resp["hits"]["hits"][0]["_source"] if resp["hits"]["hits"] else None
+    except Exception:
+        es_hit = None
+
+    # Neo4j でも存在確認
+    neo4j_exists = False
+    driver = get_neo4j_driver()
+    try:
+        with driver.session() as session:
+            result = session.run(
+                "MATCH (d:Document {id: $id}) RETURN d.id LIMIT 1",
+                id=document_id,
+            )
+            neo4j_exists = result.single() is not None
+    except Exception:
+        pass
+    finally:
+        driver.close()
+
+    if es_hit is None and not neo4j_exists:
+        raise HTTPException(status_code=404, detail={"error": "document_not_found"})
+
+    scope = (es_hit or {}).get("scope", "official")
+    metadata = (es_hit or {}).get("metadata", {})
+    file_deleted = False
+
+    # temporary の場合: /tmp のファイルを削除
+    if scope == "temporary":
+        temp_path_str = metadata.get("temp_file_path")
+        if temp_path_str:
+            try:
+                Path(temp_path_str).unlink(missing_ok=True)
+                file_deleted = True
+            except Exception as exc:
+                logger.warning("DELETE: 一時ファイル削除エラー %s: %s", temp_path_str, exc)
+
+    # ES から削除
+    try:
+        es.delete_by_query(
+            index=ES_INDEX,
+            body={"query": {"term": {"document_id": document_id}}},
+        )
+    except Exception as exc:
+        logger.warning("DELETE: ES 削除エラー %s: %s", document_id, exc)
+
+    # Neo4j から削除（3ステップ: MENTIONS → HAS_CHUNK+Chunk → Document）
+    # Entity ノードは他ドキュメントから参照されている可能性があるため削除しない
+    driver = get_neo4j_driver()
+    try:
+        with driver.session() as session:
+            session.run(
+                "MATCH (c:Chunk {document_id: $id})-[r:MENTIONS]->() DELETE r",
+                id=document_id,
+            )
+            session.run(
+                "MATCH (d:Document {id: $id})-[r:HAS_CHUNK]->(c:Chunk) DELETE r, c",
+                id=document_id,
+            )
+            session.run(
+                "MATCH (d:Document {id: $id}) DELETE d",
+                id=document_id,
+            )
+    except Exception as exc:
+        logger.warning("DELETE: Neo4j 削除エラー %s: %s", document_id, exc)
+    finally:
+        driver.close()
+
+    return {
+        "status": "ok",
+        "document_id": document_id,
+        "scope": scope,
+        "file_deleted": file_deleted,
+        "git_committed": False,
+    }
+
+
+@app.post("/documents/{document_id}/reingest")
+def reingest_document(document_id: str) -> dict[str, Any]:
+    """mismatch 状態のドキュメントを再取り込みして整合性を修復する。
+
+    scope × source による 3 ケース分岐:
+    - official file: source_ref から input/ のファイルを再取り込み
+    - official growi: metadata.growi_page_id を使って Growi API から再取得
+    - temporary: metadata.temp_file_path でファイルの存在確認 → 再取り込み or 409
+    """
+    from ingest import build_growi_payload, build_markdown_payload, build_pdf_payload, build_txt_payload
+
+    es = get_es_client()
+
+    # ES からドキュメント情報を取得
+    try:
+        resp = es.search(
+            index=ES_INDEX,
+            body={
+                "query": {"term": {"document_id": document_id}},
+                "collapse": {"field": "document_id"},
+                "_source": ["document_id", "scope", "source", "source_ref", "metadata"],
+                "size": 1,
+            },
+        )
+        es_src = resp["hits"]["hits"][0]["_source"] if resp["hits"]["hits"] else None
+    except Exception:
+        es_src = None
+
+    # ES になければ Neo4j から取得
+    if es_src is None:
+        driver = get_neo4j_driver()
+        try:
+            with driver.session() as session:
+                result = session.run(
+                    "MATCH (d:Document {id: $id}) "
+                    "RETURN d.scope AS scope, d.source AS source, d.source_ref AS source_ref LIMIT 1",
+                    id=document_id,
+                )
+                record = result.single()
+        finally:
+            driver.close()
+        if not record:
+            raise HTTPException(status_code=404, detail={"error": "document_not_found"})
+        scope = record["scope"] or "official"
+        source = record["source"]
+        source_ref = record["source_ref"]
+        metadata: dict[str, Any] = {}
+    else:
+        scope = es_src.get("scope", "official")
+        source = es_src.get("source")
+        source_ref = es_src.get("source_ref")
+        metadata = es_src.get("metadata", {})
+
+    # --- temporary: temp_file_path でファイル存在確認 ---
+    if scope == "temporary":
+        temp_path_str = metadata.get("temp_file_path")
+        if not temp_path_str or not Path(temp_path_str).exists():
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "temp_file_expired",
+                    "message": "一時ファイルは既に削除されています。再アップロードしてください",
+                },
+            )
+        temp_path = Path(temp_path_str)
+        ext = temp_path.suffix.lower()
+        try:
+            if ext == ".pdf":
+                payload = build_pdf_payload(temp_path, temp_path.parent)
+            elif ext == ".md":
+                payload = build_markdown_payload(temp_path, temp_path.parent)
+            else:
+                payload = build_txt_payload(temp_path, temp_path.parent)
+        except SystemExit:
+            raise HTTPException(status_code=422, detail={"error": "file_parse_error"})
+        payload["document_id"] = document_id
+        payload.setdefault("metadata", {})["temp_file_path"] = temp_path_str
+        expires_dt = datetime.now(timezone.utc) + timedelta(hours=TEMP_DOC_TTL_HOURS)
+        payload["scope"] = "temporary"
+        payload["expires_at"] = expires_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # --- official growi: metadata.growi_page_id を使用 ---
+    elif source == "growi":
+        if not GROWI_URL or not GROWI_API_KEY:
+            raise HTTPException(status_code=503, detail={"error": "growi_not_configured"})
+        page_id = metadata.get("growi_page_id")
+        if not page_id:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "growi_page_id_not_found_in_metadata"},
+            )
+        try:
+            payload = build_growi_payload(GROWI_URL, page_id, GROWI_API_KEY)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail={"error": "growi_api_error", "detail": str(exc)})
+        payload.setdefault("metadata", {})["growi_page_id"] = page_id
+        payload["scope"] = "official"
+        payload["expires_at"] = None
+
+    # --- official file: source_ref から input/ のファイルを読む ---
+    else:
+        if not source_ref:
+            raise HTTPException(status_code=422, detail={"error": "source_ref_not_found"})
+        input_root = Path(INGEST_INPUT_ROOT).resolve()
+        file_path = (input_root / source_ref).resolve()
+        # パストラバーサル防止
+        try:
+            file_path.relative_to(input_root)
+        except ValueError:
+            raise HTTPException(status_code=400, detail={"error": "invalid_source_ref"})
+        if not file_path.exists():
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "source_file_not_found", "path": source_ref},
+            )
+        ext = file_path.suffix.lower()
+        try:
+            if ext == ".pdf":
+                payload = build_pdf_payload(file_path, input_root)
+            elif ext == ".md":
+                payload = build_markdown_payload(file_path, input_root)
+            else:
+                payload = build_txt_payload(file_path, input_root)
+        except SystemExit:
+            raise HTTPException(status_code=422, detail={"error": "file_parse_error"})
+        payload["scope"] = "official"
+        payload["expires_at"] = None
+
+    ingest(IngestRequest(**payload))
+    return {"status": "ok", "document_id": document_id, "scope": scope}
+
+
+@app.post("/ingest-growi")
+def ingest_growi_endpoint(req: IngestGrowiRequest) -> dict[str, Any]:
+    """Growi のページパスを受け取り、page_id に解決して official として取り込む。
+
+    処理の順番:
+    1. GROWI_URL / GROWI_API_KEY の確認（未設定なら 503）
+    2. Growi API で page_path → page_id に解決（見つからなければ 404）
+    3. build_growi_payload() でペイロードを組み立て
+    4. metadata["growi_page_id"] を追加（/reingest 時の再取得に使用）
+    5. scope=official, expires_at=null で ES・Neo4j に書き込む
+    """
+    import urllib.error
+    import urllib.request as urlreq
+
+    from ingest import build_growi_payload
+
+    if not GROWI_URL or not GROWI_API_KEY:
+        raise HTTPException(status_code=503, detail={"error": "growi_not_configured"})
+
+    # page_path → page_id を解決（Growi API: GET /_api/v3/pages?path=<path>）
+    encoded_path = urllib.parse.quote(req.page_path)
+    endpoint = f"{GROWI_URL.rstrip('/')}/_api/v3/pages?path={encoded_path}"
+    api_req = urlreq.Request(endpoint, headers={"Authorization": f"Bearer {GROWI_API_KEY}"})
+    try:
+        with urlreq.urlopen(api_req) as res:
+            data = json.loads(res.read())
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise HTTPException(status_code=404, detail={"error": "growi_page_not_found"})
+        raise HTTPException(status_code=500, detail={"error": "growi_api_error", "detail": str(e)})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": "growi_connection_error", "detail": str(e)})
+
+    # レスポンス構造: {"page": {...}} または {"pages": [...]}
+    page = data.get("page") or (data.get("pages") or [{}])[0]
+    page_id = str(page.get("_id") or page.get("id", ""))
+    if not page_id:
+        raise HTTPException(status_code=404, detail={"error": "growi_page_not_found"})
+
+    try:
+        payload = build_growi_payload(GROWI_URL, page_id, GROWI_API_KEY)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail={"error": "growi_api_error", "detail": str(exc)})
+
+    # growi_page_id を metadata に保存（/reingest 時に source_ref 解析の代わりに使用）
+    payload.setdefault("metadata", {})["growi_page_id"] = page_id
+    payload["scope"] = "official"
+    payload["expires_at"] = None
+
+    result = ingest(IngestRequest(**payload))
+
+    return {
+        "status": "ok",
+        "document_id": payload["document_id"],
+        "page_id": page_id,
+        "scope": "official",
+        "skipped": result.get("skipped", False),
     }
 
 
