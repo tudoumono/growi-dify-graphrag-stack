@@ -41,7 +41,7 @@ from typing import Any
 # BaseModel / Field: API の入出力データ構造を定義
 from elasticsearch import Elasticsearch
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, Request, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from neo4j import GraphDatabase
 from pydantic import BaseModel, Field
@@ -1528,3 +1528,355 @@ def list_documents(
         result_list.append({**meta, "in_es": in_es, "in_neo4j": in_neo4j, "status": status})
 
     return result_list
+
+
+_UI_HTML = """<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GraphRAG 管理</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+           max-width: 1100px; margin: 0 auto; padding: 20px 24px; color: #333; background: #fafafa; }
+    h1  { font-size: 1.4rem; border-bottom: 2px solid #4a90d9; padding-bottom: 8px; margin-bottom: 20px; }
+    h2  { font-size: 0.95rem; color: #555; margin: 24px 0 8px; text-transform: uppercase; letter-spacing: .05em; }
+    section { background: #fff; border: 1px solid #e0e0e0; border-radius: 6px; padding: 16px; margin-bottom: 16px; }
+
+    /* scope filter */
+    .scope-filter { display: flex; gap: 8px; }
+    .scope-filter label { cursor: pointer; padding: 5px 14px; border-radius: 20px;
+                          border: 1px solid #ccc; font-size: 0.85rem; user-select: none; }
+    .scope-filter input[type=radio] { display: none; }
+    .scope-filter input[type=radio]:checked + span { font-weight: 600; }
+    .scope-filter label:has(input:checked) { background: #e3f2fd; border-color: #1565c0; color: #1565c0; }
+
+    /* table */
+    table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
+    th { padding: 8px 10px; background: #f5f5f5; text-align: left; font-weight: 600;
+         font-size: 0.8rem; color: #666; border-bottom: 2px solid #e0e0e0; }
+    td { padding: 8px 10px; border-bottom: 1px solid #f0f0f0; vertical-align: middle; }
+    tr:last-child td { border-bottom: none; }
+    .col-id  { word-break: break-all; max-width: 300px; font-family: monospace; font-size: 0.8rem; }
+    .col-ref { color: #666; max-width: 200px; word-break: break-all; }
+
+    /* badges */
+    .badge { display: inline-block; padding: 2px 7px; border-radius: 3px; font-size: 0.78rem; font-weight: 500; }
+    .badge-official   { background: #e3f2fd; color: #1565c0; }
+    .badge-temporary  { background: #fff3e0; color: #bf360c; }
+    .badge-ok         { color: #2e7d32; }
+    .badge-mismatch   { color: #e65100; }
+    .badge-null       { color: #9e9e9e; font-style: italic; }
+
+    /* buttons */
+    .btn { padding: 4px 11px; border: none; border-radius: 4px; cursor: pointer;
+           font-size: 0.8rem; font-weight: 500; transition: opacity .15s; }
+    .btn:hover    { opacity: .75; }
+    .btn:disabled { opacity: .35; cursor: not-allowed; }
+    .btn-danger  { background: #ffebee; color: #c62828; }
+    .btn-primary { background: #e3f2fd; color: #1565c0; }
+    .btn-success { background: #e8f5e9; color: #2e7d32; }
+    .btn-sm      { padding: 3px 8px; font-size: 0.75rem; }
+
+    /* upload */
+    .upload-area { border: 2px dashed #bdbdbd; border-radius: 8px; padding: 28px 20px;
+                   text-align: center; cursor: pointer; transition: background .2s, border-color .2s;
+                   color: #757575; }
+    .upload-area.dragover { background: #e3f2fd; border-color: #1565c0; color: #1565c0; }
+    .upload-area p { margin: 4px 0; }
+    .upload-area .hint { font-size: 0.78rem; color: #9e9e9e; }
+
+    /* messages */
+    .msg { padding: 8px 14px; border-radius: 4px; font-size: 0.875rem; margin-top: 8px; }
+    .msg-ok    { background: #e8f5e9; color: #2e7d32; }
+    .msg-error { background: #ffebee; color: #c62828; }
+    .msg-info  { background: #e3f2fd; color: #1565c0; }
+
+    /* job status */
+    .job-line { margin-top: 10px; font-size: 0.85rem; color: #555; display: flex; align-items: center; gap: 8px; }
+    .spinner  { width: 14px; height: 14px; border: 2px solid #90caf9;
+                border-top-color: #1565c0; border-radius: 50%; animation: spin .7s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <h1>GraphRAG ファイル管理</h1>
+
+  <!-- scope filter -->
+  <section>
+    <h2>表示フィルタ</h2>
+    <div class="scope-filter">
+      <label><input type="radio" name="scope" value="official" checked><span>正式のみ</span></label>
+      <label><input type="radio" name="scope" value="temporary"><span>一時のみ</span></label>
+      <label><input type="radio" name="scope" value="all"><span>すべて</span></label>
+    </div>
+  </section>
+
+  <!-- document list -->
+  <section>
+    <h2>ドキュメント一覧
+      <button class="btn btn-primary btn-sm" style="margin-left:8px" onclick="fetchDocs()">更新</button>
+    </h2>
+    <div id="global-msg"></div>
+    <table>
+      <thead>
+        <tr>
+          <th>document_id</th>
+          <th>source_ref</th>
+          <th>scope</th>
+          <th>status</th>
+          <th>操作</th>
+        </tr>
+      </thead>
+      <tbody id="doc-tbody"><tr><td colspan="5">読み込み中...</td></tr></tbody>
+    </table>
+  </section>
+
+  <!-- file upload -->
+  <section>
+    <h2>一時ファイルアップロード</h2>
+    <div class="upload-area" id="upload-area" onclick="document.getElementById('file-input').click()">
+      <p>ここにファイルをドロップ &nbsp;または&nbsp; クリックして選択</p>
+      <p class="hint">.pdf / .md / .txt のみ対応 &nbsp;—&nbsp; 取り込み後 <strong id="ttl-label">24h</strong> で自動削除</p>
+      <input type="file" id="file-input" accept=".pdf,.md,.txt" style="display:none"
+             onchange="uploadFile(this.files[0]); this.value=''">
+    </div>
+    <div id="upload-msg"></div>
+  </section>
+
+  <!-- ingest-dir -->
+  <section>
+    <h2>正式一括再同期</h2>
+    <button class="btn btn-success" id="ingest-dir-btn" onclick="startIngestDir()">▶ /ingest-dir を実行</button>
+    <div class="job-line" id="job-line" style="display:none">
+      <div class="spinner" id="job-spinner"></div>
+      <span id="job-status-text"></span>
+    </div>
+  </section>
+
+  <script>
+    // XSS 対策: HTML 特殊文字をエスケープ
+    function esc(s) {
+      return String(s ?? '')
+        .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    // 残り時間を「Xh」形式で返す
+    function expiresIn(iso) {
+      if (!iso) return '';
+      const diff = new Date(iso) - Date.now();
+      if (diff <= 0) return ' (期限切れ)';
+      return ' ' + Math.ceil(diff / 3600000) + 'h';
+    }
+
+    function showGlobalMsg(text, type = 'ok') {
+      const el = document.getElementById('global-msg');
+      el.innerHTML = `<div class="msg msg-${type}">${esc(text)}</div>`;
+      setTimeout(() => { el.innerHTML = ''; }, 5000);
+    }
+
+    // ---- ドキュメント一覧 ----
+    function getScope() {
+      return document.querySelector('input[name="scope"]:checked').value;
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+      fetchDocs();
+      // TTL ラベルを /providers から取得できないので ENV 値をそのまま表示
+      // (実際の TTL は TEMP_DOC_TTL_HOURS 環境変数に依存)
+    });
+    document.querySelectorAll('input[name="scope"]').forEach(r =>
+      r.addEventListener('change', fetchDocs));
+
+    async function fetchDocs() {
+      const scope = getScope();
+      const tbody = document.getElementById('doc-tbody');
+      tbody.innerHTML = '<tr><td colspan="5" style="color:#9e9e9e">読み込み中...</td></tr>';
+      try {
+        const res = await fetch('/documents?scope=' + scope);
+        const docs = await res.json();
+        if (!Array.isArray(docs) || docs.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="5" style="color:#9e9e9e">ドキュメントなし</td></tr>';
+          return;
+        }
+        tbody.innerHTML = docs.map(doc => {
+          const scopeCell = doc.scope === 'official'
+            ? '<span class="badge badge-official">正式</span>'
+            : doc.scope === 'temporary'
+              ? `<span class="badge badge-temporary">一時${expiresIn(doc.expires_at)}</span>`
+              : `<span class="badge-null">${esc(doc.scope ?? '-')}</span>`;
+
+          const statusCell = doc.status === 'ok'
+            ? '<span class="badge-ok">✅ ok</span>'
+            : '<span class="badge-mismatch">⚠ mismatch</span>';
+
+          const note = (!doc.in_es ? ' <span style="color:#9e9e9e;font-size:.75rem">(ES欠)</span>'
+                     : !doc.in_neo4j ? ' <span style="color:#9e9e9e;font-size:.75rem">(Neo4j欠)</span>'
+                     : '');
+
+          // 再取込: mismatch かつ temporary でない場合のみ表示
+          const reingestBtn = (doc.status === 'mismatch' && doc.scope !== 'temporary')
+            ? `<button class="btn btn-primary btn-sm" data-id="${esc(doc.document_id)}"
+                       onclick="reingestDoc(this.dataset.id)">再取込</button> `
+            : '';
+
+          return `<tr>
+            <td class="col-id">${esc(doc.document_id)}${note}</td>
+            <td class="col-ref">${esc(doc.source_ref ?? '-')}</td>
+            <td>${scopeCell}</td>
+            <td>${statusCell}</td>
+            <td>
+              ${reingestBtn}<button class="btn btn-danger btn-sm" data-id="${esc(doc.document_id)}"
+                       onclick="deleteDoc(this.dataset.id)">削除</button>
+            </td>
+          </tr>`;
+        }).join('');
+      } catch (e) {
+        tbody.innerHTML = `<tr><td colspan="5" style="color:#c62828">エラー: ${esc(e.message)}</td></tr>`;
+      }
+    }
+
+    async function deleteDoc(docId) {
+      if (!confirm('削除しますか？\\n' + docId)) return;
+      try {
+        const res = await fetch('/documents/' + encodeURIComponent(docId), { method: 'DELETE' });
+        const data = await res.json();
+        if (res.ok) {
+          showGlobalMsg('削除しました: ' + docId, 'ok');
+          fetchDocs();
+        } else {
+          showGlobalMsg('削除エラー: ' + JSON.stringify(data.detail), 'error');
+        }
+      } catch (e) {
+        showGlobalMsg('エラー: ' + e.message, 'error');
+      }
+    }
+
+    async function reingestDoc(docId) {
+      try {
+        const res = await fetch('/documents/' + encodeURIComponent(docId) + '/reingest',
+                                { method: 'POST' });
+        const data = await res.json();
+        if (res.ok) {
+          showGlobalMsg('再取込完了: ' + docId, 'ok');
+          fetchDocs();
+        } else {
+          showGlobalMsg('再取込エラー: ' + JSON.stringify(data.detail), 'error');
+        }
+      } catch (e) {
+        showGlobalMsg('エラー: ' + e.message, 'error');
+      }
+    }
+
+    // ---- ファイルアップロード ----
+    const uploadArea = document.getElementById('upload-area');
+    uploadArea.addEventListener('dragover', e => {
+      e.preventDefault(); uploadArea.classList.add('dragover');
+    });
+    uploadArea.addEventListener('dragleave', () => uploadArea.classList.remove('dragover'));
+    uploadArea.addEventListener('drop', e => {
+      e.preventDefault(); uploadArea.classList.remove('dragover');
+      const f = e.dataTransfer.files[0];
+      if (f) uploadFile(f);
+    });
+
+    async function uploadFile(file) {
+      if (!file) return;
+      const msgEl = document.getElementById('upload-msg');
+      msgEl.innerHTML = '<div class="msg msg-info">アップロード中: ' + esc(file.name) + '</div>';
+      const fd = new FormData();
+      fd.append('file', file);
+      try {
+        const res = await fetch('/ingest-temp', { method: 'POST', body: fd });
+        const data = await res.json();
+        if (res.ok) {
+          msgEl.innerHTML = `<div class="msg msg-ok">
+            取り込み完了: <strong>${esc(data.document_id)}</strong>
+            &nbsp;|&nbsp; 有効期限: ${esc(data.expires_at)}
+            ${data.skipped ? '&nbsp;<span style="color:#e65100">(内容未変更・スキップ)</span>' : ''}
+          </div>`;
+          // 一時データが見えるよう scope=all に切り替えてリスト更新
+          document.querySelector('input[name="scope"][value="all"]').checked = true;
+          fetchDocs();
+        } else {
+          msgEl.innerHTML = `<div class="msg msg-error">エラー: ${esc(JSON.stringify(data.detail))}</div>`;
+        }
+      } catch (e) {
+        msgEl.innerHTML = `<div class="msg msg-error">エラー: ${esc(e.message)}</div>`;
+      }
+    }
+
+    // ---- ingest-dir ----
+    let currentJobId = null;
+    let pollTimer  = null;
+
+    async function startIngestDir() {
+      const btn = document.getElementById('ingest-dir-btn');
+      const line = document.getElementById('job-line');
+      const spinner = document.getElementById('job-spinner');
+      const statusText = document.getElementById('job-status-text');
+
+      btn.disabled = true;
+      line.style.display = 'flex';
+      spinner.style.display = 'block';
+      statusText.textContent = '開始中...';
+
+      try {
+        const res = await fetch('/ingest-dir', { method: 'POST' });
+        const data = await res.json();
+        if (res.status === 202) {
+          currentJobId = data.job_id;
+          statusText.textContent = 'ジョブ実行中 (' + currentJobId.slice(0, 8) + '...)';
+          startPolling();
+        } else if (res.status === 409) {
+          // 既に実行中のジョブをポーリング
+          currentJobId = data.detail.running_job_id;
+          statusText.textContent = '実行中ジョブに接続 (' + currentJobId.slice(0, 8) + '...)';
+          btn.disabled = false;
+          startPolling();
+        } else {
+          statusText.textContent = 'エラー: ' + JSON.stringify(data);
+          btn.disabled = false;
+          spinner.style.display = 'none';
+        }
+      } catch (e) {
+        statusText.textContent = 'エラー: ' + e.message;
+        btn.disabled = false;
+        spinner.style.display = 'none';
+      }
+    }
+
+    function startPolling() {
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = setInterval(async () => {
+        if (!currentJobId) return;
+        try {
+          const res = await fetch('/ingest-job/' + currentJobId);
+          if (!res.ok) { clearInterval(pollTimer); return; }
+          const job = await res.json();
+          const statusText = document.getElementById('job-status-text');
+          statusText.textContent =
+            job.status + ' — processed: ' + job.processed +
+            ', skipped: ' + job.skipped + ', failed: ' + job.failed;
+          if (job.status === 'done' || job.status === 'failed') {
+            clearInterval(pollTimer);
+            document.getElementById('ingest-dir-btn').disabled = false;
+            document.getElementById('job-spinner').style.display = 'none';
+            fetchDocs();
+          }
+        } catch (e) { clearInterval(pollTimer); }
+      }, 2000);
+    }
+  </script>
+</body>
+</html>
+"""
+
+
+@app.get("/ui", response_class=HTMLResponse)
+def management_ui() -> HTMLResponse:
+    """GraphRAG ドキュメント管理 UI。
+    ドキュメント一覧・一時ファイルアップロード・ingest-dir 実行を1画面で操作できる。
+    """
+    return HTMLResponse(content=_UI_HTML)
