@@ -41,9 +41,12 @@ DIfy_Growi_Langfuse/
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   ├── providers.py
-│   ├── main.py
-│   └── ingest.py
+│   ├── main.py         # FastAPI アプリ本体（全エンドポイント）
+│   └── ingest.py       # ドキュメント変換ユーティリティ（ライブラリ）
 └── docs/
+    ├── SETUP_GUIDE.md
+    ├── SERVICES_GUIDE.md
+    ├── spec_phase*.md
     └── graphrag-learning.md
 ```
 
@@ -163,15 +166,15 @@ POST 例:
 
 ### GROWI から取り込む
 
+`graphrag/.env` に `GROWI_URL` と `GROWI_API_KEY` を設定した上で、API を呼びます。
+
 ```bash
-cd graphrag
-source .venv/bin/activate
-python ingest.py \
-  --url http://localhost:3300 \
-  --page-id 12345 \
-  --api-key YOUR_GROWI_API_KEY \
-  --category 技術文書
+curl -s -X POST http://localhost:8080/ingest-growi \
+  -H "Content-Type: application/json" \
+  -d '{"page_id": "12345", "category": "技術文書"}'
 ```
+
+> `page_id` は GROWI ページ URL 末尾の数字、または管理画面で確認できます。
 
 ### Dify から GraphRAG を呼ぶ
 
