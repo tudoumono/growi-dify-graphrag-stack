@@ -87,7 +87,8 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - ${HOME}/.aws:/root/.aws:ro
-      - ${INGEST_INPUT_ROOT:-../input}:/input:ro
+      - ${INGEST_INPUT_ROOT:-../input}:/input:rw
+      - ${GIT_REPO_ROOT:-..}/.git:/repo/.git:rw
     environment:
       INGEST_INPUT_ROOT: /input
       ELASTICSEARCH_HOST: graphrag-es
@@ -123,6 +124,11 @@ services:
       TEMP_DOC_TTL_HOURS: ${TEMP_DOC_TTL_HOURS:-24}
       GROWI_URL: ${GROWI_URL:-}
       GROWI_API_KEY: ${GROWI_API_KEY:-}
+
+      # official ファイル削除時の Git コミット用（コンテナ内から /repo/.git を参照）
+      # GIT_WORK_TREE=/ にすることで、インデックスのパス(input/...) とファイルシステムの /input/... が一致する
+      GIT_DIR: /repo/.git
+      GIT_WORK_TREE: /
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 30s

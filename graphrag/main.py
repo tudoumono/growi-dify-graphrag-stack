@@ -26,6 +26,7 @@ import hashlib
 import json
 import logging
 import os
+import subprocess
 import urllib.parse
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -971,7 +972,6 @@ async def ingest_temp(file: UploadFile = File(...)) -> dict[str, Any]:
     content = await file.read()
     temp_path.write_bytes(content)
 
-    # build_*_payload() でペイロードを組み立てる（SystemExit はキャッチして 422 に変換）
     from ingest import build_markdown_payload, build_pdf_payload, build_txt_payload
     try:
         if ext == ".pdf":
@@ -980,11 +980,11 @@ async def ingest_temp(file: UploadFile = File(...)) -> dict[str, Any]:
             payload = build_markdown_payload(temp_path, temp_dir)
         else:
             payload = build_txt_payload(temp_path, temp_dir)
-    except SystemExit:
+    except (ValueError, RuntimeError) as exc:
         temp_path.unlink(missing_ok=True)
         raise HTTPException(
             status_code=422,
-            detail={"error": "file_parse_error", "message": "ファイルの解析に失敗しました"},
+            detail={"error": "file_parse_error", "message": str(exc)},
         )
 
     # document_id を一時ファイル用プレフィックスで上書き（build_*_payload() は変更しない）
@@ -1020,9 +1020,6 @@ def run_ingest_dir(job_id: str) -> None:
     4. ingest() 内部ロジックを直接呼び出す（HTTP は介さない）
     5. processed / skipped / failed をカウントしてジョブを更新
     """
-    # ingest.py の build_*_payload() を利用する。
-    # sys.exit(1) が残っているため SystemExit をキャッチして失敗扱いにする。
-    # Phase 5a で build_*_payload() が ValueError/RuntimeError に移行後、このキャッチは削除する。
     from ingest import build_markdown_payload, build_pdf_payload, build_txt_payload
 
     input_root = Path(INGEST_INPUT_ROOT).resolve()
@@ -1064,10 +1061,9 @@ def run_ingest_dir(job_id: str) -> None:
                 skipped += 1
             else:
                 processed += 1
-        except SystemExit:
-            # build_*_payload() の sys.exit(1) をキャッチ（Phase 5a でリファクタ予定）
+        except (ValueError, RuntimeError) as exc:
             failed += 1
-            errors.append(f"失敗: {f.name}")
+            errors.append(f"{f.name}: {exc}")
         except Exception as exc:
             failed += 1
             errors.append(f"{f.name}: {exc}")
@@ -1188,8 +1184,11 @@ def delete_document(document_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail={"error": "document_not_found"})
 
     scope = (es_hit or {}).get("scope", "official")
+    source = (es_hit or {}).get("source")
+    source_ref = (es_hit or {}).get("source_ref")
     metadata = (es_hit or {}).get("metadata", {})
     file_deleted = False
+    git_committed = False
 
     # temporary の場合: /tmp のファイルを削除
     if scope == "temporary":
@@ -1200,6 +1199,37 @@ def delete_document(document_id: str) -> dict[str, Any]:
                 file_deleted = True
             except Exception as exc:
                 logger.warning("DELETE: 一時ファイル削除エラー %s: %s", temp_path_str, exc)
+
+    # official file（growi 以外）: ファイル物理削除 + Git コミット
+    elif scope == "official" and source != "growi" and source_ref:
+        input_root = Path(INGEST_INPUT_ROOT).resolve()
+        file_path = (input_root / source_ref).resolve()
+        try:
+            file_path.relative_to(input_root)  # パストラバーサル防止
+            if file_path.exists():
+                # git rm: ファイル削除 + ステージング
+                git_rm = subprocess.run(
+                    ["git", "rm", "--force", str(file_path)],
+                    capture_output=True, text=True,
+                )
+                if git_rm.returncode == 0:
+                    # git commit
+                    git_ci = subprocess.run(
+                        ["git", "commit", "-m", f"delete: {source_ref}"],
+                        capture_output=True, text=True,
+                    )
+                    # "nothing to commit" は exit code 1 だが正常
+                    git_committed = git_ci.returncode == 0
+                    file_deleted = True
+                else:
+                    # git rm 失敗時はファイルのみ直接削除
+                    file_path.unlink(missing_ok=True)
+                    file_deleted = True
+                    logger.warning("DELETE: git rm 失敗、直接削除しました: %s", git_rm.stderr)
+        except ValueError:
+            logger.warning("DELETE: パストラバーサル防止のためスキップ: %s", source_ref)
+        except Exception as exc:
+            logger.warning("DELETE: ファイル削除エラー %s: %s", source_ref, exc)
 
     # ES から削除
     try:
@@ -1314,8 +1344,8 @@ def reingest_document(document_id: str) -> dict[str, Any]:
                 payload = build_markdown_payload(temp_path, temp_path.parent)
             else:
                 payload = build_txt_payload(temp_path, temp_path.parent)
-        except SystemExit:
-            raise HTTPException(status_code=422, detail={"error": "file_parse_error"})
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(status_code=422, detail={"error": "file_parse_error", "message": str(exc)})
         payload["document_id"] = document_id
         payload.setdefault("metadata", {})["temp_file_path"] = temp_path_str
         expires_dt = datetime.now(timezone.utc) + timedelta(hours=TEMP_DOC_TTL_HOURS)
@@ -1364,8 +1394,8 @@ def reingest_document(document_id: str) -> dict[str, Any]:
                 payload = build_markdown_payload(file_path, input_root)
             else:
                 payload = build_txt_payload(file_path, input_root)
-        except SystemExit:
-            raise HTTPException(status_code=422, detail={"error": "file_parse_error"})
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(status_code=422, detail={"error": "file_parse_error", "message": str(exc)})
         payload["scope"] = "official"
         payload["expires_at"] = None
 
